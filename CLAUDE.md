@@ -6,8 +6,9 @@ The plugin is `plugins/pixi-guard/` (plugin name `pixi`, v0.1.0). User docs:
 
 ## Layout
 
-- `hooks/guard.sh`: everything. `guard.sh session` (SessionStart context) and
-  `guard.sh pre` (PreToolUse on Bash). The `scan` awk program is a small
+- `hooks/guard.sh`: everything. `guard.sh session` (SessionStart context),
+  `guard.sh pre` (PreToolUse on Bash) and `guard.sh wrap-path [DIR]` (for the
+  skill). The `scan` awk program is a small
   shell tokenizer: quotes, comments, `$(...)`, backticks, heredocs, `sh -c`,
   `eval`, `find -exec`, wrappers (`env`, `sudo`, `timeout`, ...).
 - `skills/project/SKILL.md`: how to convert or wrap a project (the refusal
@@ -32,8 +33,10 @@ claude --plugin-dir .             # try it without installing
 3. Refusals are `deny` with a reason written for Claude; `PIXI_GUARD=ask`
    (an unquoted assignment prefix) turns them into `ask`, never `allow`.
 4. Anything that starts with `pixi` is allowed as is.
-5. The wrapper path (`wrap_manifest`) is the only place it's computed; the
-   refusal gives it to Claude, the skill doesn't recompute it.
+5. The wrapper path (`wrap_manifest`) is the only place it's computed. The
+   refusal names it, and the skill gets it from `guard.sh wrap-path DIR`
+   (Claude may set up a wrapper without ever being refused). Both use the
+   physical path (`pwd -P`), so `/tmp` and `/private/tmp` agree.
 
 Add a test for every behavior change, both a command that must be refused
 and a near miss that must pass.

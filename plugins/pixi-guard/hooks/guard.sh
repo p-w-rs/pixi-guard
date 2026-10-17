@@ -11,7 +11,7 @@
 # Fails open: anything unexpected means no output, and the call goes ahead.
 
 mode=$1
-input=$(cat)
+[ "$mode" = wrap-path ] || input=$(cat)
 st=${PIXI_GUARD_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/pixi-guard}
 wrapdir=${PIXI_GUARD_WRAP_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/pixi-guard/wrap}
 pixi_bin=${PIXI_GUARD_PIXI:-pixi}
@@ -273,6 +273,15 @@ out_decision() {
 }
 
 case $mode in
+wrap-path)
+	# guard.sh wrap-path [DIR]: the out-of-folder wrapper manifest for the
+	# Python project containing DIR (default: the current folder).
+	d=$(cd "${2:-.}" 2>/dev/null && pwd -P) || exit 1
+	classify "$d"
+	wrap_manifest "${proj_root:-$d}"
+	echo
+	;;
+
 session)
 	msg="pixi-guard: on this machine Python runs only through pixi. Use \`pixi run ...\` in a pixi workspace, \`pixi exec [--spec pkg] python ...\` for one-offs, \`pixi add pkg\` (conda-forge) or \`pixi add --pypi pkg\` for packages. Never run python, pip, uv, conda, poetry and the like directly: Bash calls that do are refused. For a project that is not on pixi, load the skill pixi:project (convert it, or wrap it if it isn't the user's code)."
 	if ! have_pixi; then
@@ -295,6 +304,8 @@ pre)
 
 	cwd=$(field cwd)
 	[ -n "$cwd" ] || cwd=$PWD
+	# Physical path, so the wrapper key matches `guard.sh wrap-path` (/tmp vs /private/tmp).
+	cwd=$(cd "$cwd" 2>/dev/null && pwd -P) || cwd=$PWD
 	why="pixi-guard: refused, \`$hit\` would run Python outside pixi."
 
 	if ! have_pixi; then

@@ -21,8 +21,10 @@ and what it uses now (`pyproject.toml` and its build backend, `requirements*.txt
   are. Right for someone else's code, upstream repos, or when the user says
   not to change the project.
 
-If the user already said which, don't ask again. Never change someone else's
-project setup without a clear yes.
+Recommend one, then **stop and wait for the answer**, even when the owner
+looks obvious: both options create files in the user's folder. Skip the
+question only if the user already said which (in this conversation, or by
+asking for it). Never change someone else's project setup without a clear yes.
 
 ## 2a. Convert
 
@@ -39,6 +41,8 @@ Work on a clean tree (or a branch) so the user can review the diff.
 - `uv.lock` / `poetry.lock` / `Pipfile`: treat as `pyproject.toml` (or
   requirements); the old lock file stays until the user says to remove it.
 - Python version: take it from `requires-python` / `.python-version`.
+- Platforms: pixi init locks only this machine's. If the project also runs
+  elsewhere (CI, Linux), `pixi workspace platform add linux-64 ...`.
 - Turn the usual commands (Makefile, tox, README, CI) into `[tasks]`:
   `pixi task add test "pytest"`.
 - `pixi install`, run the tests through pixi, and show the user the diff.
@@ -68,17 +72,22 @@ they are tracked, delete them if pixi created them. Then:
 - `git status` must show nothing new. Never commit these files.
 
 **Nothing may be added to the folder** (not git, read-only, or the user said
-so): use the out-of-tree manifest whose path pixi-guard's refusal gave you
-(under `~/.local/share/pixi-guard/wrap/`). pixi-guard recognizes it from then on.
+so): the wrapper lives outside the folder, at a path pixi-guard picks. Get it
+from the project folder with the hook script next to this skill (this skill's
+base directory is shown above; the script is two levels up):
 
 ```bash
-pixi init --format pixi "<wrap dir>"
-pixi add --manifest-path "<wrap dir>/pixi.toml" python=<version>
-pixi add --manifest-path "<wrap dir>/pixi.toml" --pypi --editable "<name> @ file://<project root>"
+m=$(sh "<skill base dir>/../../hooks/guard.sh" wrap-path .)   # .../pixi-guard/wrap/<name>-<sum>/pixi.toml
+pixi init --format pixi "$(dirname "$m")"
+pixi add --manifest-path "$m" python=<version>
+pixi add --manifest-path "$m" --pypi --editable "<name> @ file://$PWD"
 ```
 
-Commands run in the current folder: `pixi run --manifest-path "<wrap dir>/pixi.toml" python ...`.
-Tell the user that command (they may want a shell alias) and add tasks there.
+pixi-guard recognizes the project as wrapped from then on. Ad-hoc commands
+run in the current folder: `pixi run --manifest-path "$m" python ...`. Tasks
+run in the manifest's folder, so give them the project as `cwd`:
+`test = { cmd = "pytest", cwd = "<project root>" }`. Tell the user the run
+command (they may want a shell alias).
 
 ## 3. Tell the user
 

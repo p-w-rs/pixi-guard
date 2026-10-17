@@ -136,6 +136,19 @@ check("non-pixi python project", "not on pixi" in r and "pixi:project" in r and 
 wrap = r.split("put the wrapper at ")[1].split(" ")[0].rstrip(".")
 check("wrapper path is under the wrap dir", wrap.startswith(str(TMP / "wrap")) and wrap.endswith("/pixi.toml"), wrap)
 
+def wrap_path(d):
+    e = dict(os.environ, PIXI_GUARD_WRAP_DIR=str(TMP / "wrap"), HOME=str(TMP))
+    return subprocess.run(["sh", str(GUARD), "wrap-path", str(d)], capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, env=e).stdout.strip()
+
+
+check("wrap-path from a subfolder matches the refusal", wrap_path(py_proj / "pkg") == wrap, wrap_path(py_proj / "pkg"))
+link = TMP / "link-to-pyproj"
+link.symlink_to(py_proj)
+check("wrap-path resolves symlinks", wrap_path(link / "pkg") == wrap)
+r = reason("python x", cwd=link / "pkg")
+check("refusal through a symlinked cwd names the same wrapper", wrap in r, r)
+check("wrap-path for a plain folder", wrap_path(PLAIN).endswith("/pixi.toml"))
 Path(wrap).parent.mkdir(parents=True)
 Path(wrap).write_text("[workspace]\n")
 r = reason("python x", cwd=py_proj / "pkg")
