@@ -1,0 +1,12 @@
+# Dev runtime for pixi-guard's tests. The plugin itself needs neither pixi nor
+# Python: its hook is POSIX sh + awk, so it can tell a user that pixi is missing.
+[workspace]
+name = "pixi-guard"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+python = "3.12.*"
+
+[tasks]
+test = "python tests/run_tests.py"

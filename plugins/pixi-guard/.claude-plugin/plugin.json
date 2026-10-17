@@ -1,0 +1,9 @@
+{
+  "name": "pixi",
+  "version": "0.1.0",
+  "description": "Keep Python on pixi: refuse python, pip, uv, conda, poetry and friends outside pixi (the user can still approve one), tell the user when pixi is missing, and convert or wrap non-pixi projects.",
+  "author": {
+    "name": "p-w-rs"
+  },
+  "keywords": ["pixi", "python", "pip", "uv", "hooks", "environments"]
+}

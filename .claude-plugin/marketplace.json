@@ -1,0 +1,16 @@
+{
+  "name": "pixi-guard",
+  "owner": {
+    "name": "p-w-rs"
+  },
+  "metadata": {
+    "description": "Marketplace for the pixi-guard plugin."
+  },
+  "plugins": [
+    {
+      "name": "pixi",
+      "source": "./plugins/pixi-guard",
+      "description": "Keep Python on pixi: no python/pip/uv/conda outside pixi without the user's yes; convert or wrap non-pixi projects."
+    }
+  ]
+}
