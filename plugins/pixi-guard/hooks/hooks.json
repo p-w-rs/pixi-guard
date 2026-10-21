@@ -5,7 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh\" session",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh", "session"],
             "timeout": 10
           }
         ]
@@ -13,11 +14,12 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Monitor|mcp__terminal__run_in_terminal|mcp__plugin_check_jobs__job_start",
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh\" pre",
+            "command": "sh",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh", "pre"],
             "timeout": 10
           }
         ]

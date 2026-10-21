@@ -10,3 +10,4 @@ python = "3.12.*"
 
 [tasks]
 test = "python tests/run_tests.py"
+test-matrix = "python tests/run_tests.py --matrix"

@@ -53,15 +53,26 @@ Work on a clean tree (or a branch) so the user can review the diff.
 ## 2b. Wrap
 
 **In a git checkout (preferred):** a `pixi.toml` at the project root that
-git never sees, so `pixi run ...` works there as usual.
+git never sees, so `pixi run ...` works there as usual. Run this from the
+project root. `pixi init` also edits `.gitignore` and `.gitattributes`, so it
+runs in a temporary folder and only the manifest is moved in; the project's
+own files are never touched. The ignore rules go to `info/exclude`, which
+`--git-path` finds in worktrees too:
 
 ```bash
-pixi init --format pixi .     # creates pixi.toml; also adds to .gitignore and .gitattributes
-printf '%s\n' /pixi.toml /pixi.lock /.pixi/ >> "$(git rev-parse --git-dir)/info/exclude"
+name=$(basename "$PWD") && t=$(mktemp -d) &&
+pixi init --format pixi "$t/$name" && mv "$t/$name/pixi.toml" . && rm -r "$t" &&
+ex=$(git rev-parse --git-path info/exclude) && mkdir -p "$(dirname "$ex")" &&
+p=$(git rev-parse --show-prefix) &&
+printf '/%s%s\n' "$p" pixi.toml "$p" pixi.lock "$p" .pixi/ >> "$ex"
 ```
 
-Undo what pixi init did to `.gitignore`/`.gitattributes`: `git checkout --` them if
-they are tracked, delete them if pixi created them. Then:
+In a worktree, `info/exclude` is shared by every checkout of the repo, so
+these lines hide a `pixi.toml` at the same path in the other checkouts too.
+Tell the user; converting one of them later needs `git add -f pixi.toml
+pixi.lock` (or those lines removed from the exclude file).
+
+Then:
 
 - `pixi add python=<version>` and the project's dependencies
   (`pixi import --format pypi-txt requirements.txt`, or `pixi add --pypi ...`).
@@ -73,11 +84,10 @@ they are tracked, delete them if pixi created them. Then:
 
 **Nothing may be added to the folder** (not git, read-only, or the user said
 so): the wrapper lives outside the folder, at a path pixi-guard picks. Get it
-from the project folder with the hook script next to this skill (this skill's
-base directory is shown above; the script is two levels up):
+from the project folder with pixi-guard's hook script:
 
 ```bash
-m=$(sh "<skill base dir>/../../hooks/guard.sh" wrap-path .)   # .../pixi-guard/wrap/<name>-<sum>/pixi.toml
+m=$(sh "${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh" wrap-path .)   # .../pixi-guard/wrap/<name>_-<sum>/pixi.toml
 pixi init --format pixi "$(dirname "$m")"
 pixi add --manifest-path "$m" python=<version>
 pixi add --manifest-path "$m" --pypi --editable "<name> @ file://$PWD"

@@ -1,26 +1,54 @@
 #!/usr/bin/env python3
 """Tests for pixi-guard. Pure stdlib; run with:
-    pixi run test
-Hermetic: the real hooks/guard.sh runs with PIXI_GUARD_HOME and
+    pixi run test            # this machine's sh and awk
+    pixi run test-matrix     # again under every awk/sh found (gawk, gawk --posix, mawk, busybox, dash)
+Hermetic: the real hooks/guard.sh runs with HOME, PIXI_GUARD_HOME and
 PIXI_GUARD_WRAP_DIR in a temp dir and PIXI_GUARD_PIXI pointing at a fake pixi
-(or at nothing, to play a machine without pixi).
+(or at nothing, to play a machine without pixi). No network.
 """
 import json
 import os
+import re
+import resource
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+REPO = ROOT.parents[1]
 GUARD = ROOT / "hooks" / "guard.sh"
-TMP = Path(tempfile.mkdtemp(prefix="pixi-guard-test-"))
+PIXI_SH = ROOT / "hooks" / "pixi.sh"
+TMP = Path(tempfile.mkdtemp(prefix="pixi-guard-test-")).resolve()
 FAKE_PIXI = TMP / "bin" / "pixi"
 FAKE_PIXI.parent.mkdir()
-FAKE_PIXI.write_text("#!/bin/sh\nexit 0\n")
+FAKE_PIXI.write_text('#!/bin/sh\necho "fake pixi $*"\n')
 FAKE_PIXI.chmod(0o755)
 PLAIN = TMP / "plain"  # a folder with no project markers
 PLAIN.mkdir()
+
+
+def pixi_bin(d):
+    """Is PATH entry d a pixi environment's bin (the hook lets tools that resolve there through)?"""
+    p = Path(d)
+    home = os.environ.get("PIXI_HOME")
+    return (p.name == "bin" and (p.parent.parent.name == "envs" and p.parent.parent.parent.name == ".pixi"
+                                 or p.parent.name == ".pixi" or (p.parent / "conda-meta" / "pixi").exists()
+                                 or (home and p.parent == Path(home))))
+
+
+# PATH without pixi environments (`pixi run test` puts this repo's own first), so that python, pytest, ...
+# resolve outside pixi unless a test puts a pixi bin folder on it.
+BASE_PATH = os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep) if d and not pixi_bin(d))
+# PATH without any pixi on it either, for the "find pixi off PATH" tests.
+NOPIXI_PATH = os.pathsep.join(d for d in BASE_PATH.split(os.pathsep) if not os.access(os.path.join(d, "pixi"), os.X_OK))
+SCRUB = ("PIXI_GUARD_TOOLS", "PIXI_GUARD_PIXI", "PIXI_GUARD_HOME", "PIXI_GUARD_WRAP_DIR", "PIXI_GUARD_WATCHDOG", "PIXI_GUARD_JOB_SH", "PIXI_HOME",
+         "CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "XDG_STATE_HOME", "XDG_DATA_HOME",
+         # read by the hook: Claude Code's shell (bash 3.x reads $(...) its own way), the active envs
+         "SHELL", "CLAUDE_CODE_SHELL", "VIRTUAL_ENV", "CONDA_PREFIX")
 
 PASS = 0
 FAIL = 0
@@ -36,39 +64,199 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name} {detail}")
 
 
-def run(mode, payload, pixi=True, **env):
-    e = dict(os.environ)
-    e.pop("PIXI_GUARD_TOOLS", None)
-    e.update(PIXI_GUARD_HOME=str(TMP / "state"), PIXI_GUARD_WRAP_DIR=str(TMP / "wrap"),
-             PIXI_GUARD_PIXI=str(FAKE_PIXI) if pixi else str(TMP / "no-such-pixi"), HOME=str(TMP))
-    e.update(env)
-    r = subprocess.run(["sh", str(GUARD), mode], input=json.dumps(payload), capture_output=True,
-                       text=True, timeout=30, env=e)
+CPU = 4  # seconds of CPU one hook call may take in the budget checks (about 1 s for 256KB; the watchdog is at 7 s)
+
+
+def timed(fn, *a, **kw):
+    """fn's result, the CPU time of the processes it ran (the hook's) and its wall time."""
+    r0, t0 = resource.getrusage(resource.RUSAGE_CHILDREN), time.time()
+    out = fn(*a, **kw)
+    r1, wall = resource.getrusage(resource.RUSAGE_CHILDREN), time.time() - t0
+    return out, (r1.ru_utime + r1.ru_stime) - (r0.ru_utime + r0.ru_stime), wall
+
+
+def budgeted(fn, *a, cpu=CPU, wall=None, **kw):
+    """timed() for a budget check: over cpu (or wall) seconds, fn runs once more and the smaller
+    times are kept. CPU time is steadier than wall time under machine load, but a busy machine
+    may run the hook on slower cores; quadratic code is far over budget (or stopped by the 7 s
+    watchdog) both times."""
+    out, c, w = timed(fn, *a, **kw)
+    if c >= cpu or (wall is not None and w >= wall):
+        out, c2, w2 = timed(fn, *a, **kw)
+        c, w = min(c, c2), min(w, w2)
+    return out, c, w
+
+
+def remeasured(fn, *a, wall, **kw):
+    """Runs of fn (which returns its wall time third), first first, for a check whose upper wall-time
+    bound only says the machine was quick enough: over wall seconds, fn runs once more, like budgeted().
+    Load slows both runs alike, and a scan nothing stops is just as slow again. The check holds every
+    run to what it proves, takes the smaller wall time for the upper bound, and lower bounds (what shows
+    something happened) from the first run alone."""
+    rs = [fn(*a, **kw)]
+    if rs[0][2] >= wall:
+        rs.append(fn(*a, **kw))
+    return rs
+
+
+def env(pixi=True, **kw):
+    e = {k: v for k, v in os.environ.items() if k not in SCRUB}
+    e.update(PIXI_GUARD_HOME=str(TMP / "state"), PIXI_GUARD_WRAP_DIR=str(TMP / "wrap"), HOME=str(TMP), SHELL="/bin/zsh",
+             PATH=BASE_PATH)
+    if pixi is not None:
+        e["PIXI_GUARD_PIXI"] = str(FAKE_PIXI) if pixi else str(TMP / "no-such-pixi")
+    for k, v in kw.items():
+        if v is None:
+            e.pop(k, None)
+        else:
+            e[k] = v
+    return e
+
+
+def run(mode, payload, pixi=True, raw=None, **kw):
+    data = raw if raw is not None else json.dumps(payload)
+    try:
+        r = subprocess.run(["sh", str(GUARD), mode], input=data, capture_output=True,
+                           text=True, timeout=60, env=env(pixi, **kw))
+    except subprocess.TimeoutExpired:
+        return None, "timed out"  # (Claude Code would have let the command run)
     out = r.stdout.strip()
-    return (json.loads(out) if out else None), r.stderr
+    try:
+        return (json.loads(out) if out else None), r.stderr
+    except ValueError:
+        return {"invalid JSON": out}, r.stderr
 
 
-def pre(cmd, cwd=PLAIN, sid="s1", **kw):
-    out, err = run("pre", {"session_id": sid, "transcript_path": "/x", "cwd": str(cwd),
-                           "hook_event_name": "PreToolUse", "tool_name": "Bash",
-                           "tool_input": {"command": cmd, "description": "d"}}, **kw)
-    return out, err
+def pre(cmd, cwd=PLAIN, sid="s1", tool="Bash", **kw):
+    return run("pre", {"session_id": sid, "transcript_path": "/x", "cwd": str(cwd),
+                       "hook_event_name": "PreToolUse", "tool_name": tool,
+                       "tool_input": {"command": cmd, "description": "d"}}, **kw)
 
 
-def decision(cmd, **kw):
-    out, err = pre(cmd, **kw)
+def verdict(out, err):
     if err:
         return "stderr:" + err
+    if out and "invalid JSON" in out:
+        return "invalid JSON: " + out["invalid JSON"]
     return out["hookSpecificOutput"]["permissionDecision"] if out else "pass"
 
 
+def decision(cmd, **kw):
+    return verdict(*pre(cmd, **kw))
+
+
+def why(out):
+    return out.get("hookSpecificOutput", {}).get("permissionDecisionReason", "") if out else ""
+
+
 def reason(cmd, **kw):
-    out, _ = pre(cmd, **kw)
-    return out["hookSpecificOutput"]["permissionDecisionReason"] if out else ""
+    return why(pre(cmd, **kw)[0])
+
+
+# checkpoint's job tool (plugin check, MCP server jobs): input {name, command | argv, cwd, redo_hint, task}.
+JOB = "mcp__plugin_check_jobs__job_start"
+
+
+def job(command=None, argv=None, cwd=None, session_cwd=PLAIN, sid="s1", **kw):
+    ti = {"name": "train", "redo_hint": "rerun; resumes from checkpoints/"}
+    if command is not None:
+        ti["command"] = command
+    if argv is not None:
+        ti["argv"] = argv
+    if cwd is not None:
+        ti["cwd"] = str(cwd)
+    ti["task"] = "train-model"
+    return run("pre", {"session_id": sid, "transcript_path": "/x", "cwd": str(session_cwd),
+                       "hook_event_name": "PreToolUse", "tool_name": JOB, "tool_input": ti}, **kw)
+
+
+def jdecision(**kw):
+    return verdict(*job(**kw))
+
+
+def jreason(**kw):
+    return why(job(**kw)[0])
+
+
+def hit(cmd, **kw):
+    m = re.search(r"`([^`]*)` would run", reason(cmd, **kw))
+    return m.group(1) if m else None
+
+
+def expect(want, cmds, tag="", **kw):
+    for cmd in cmds:
+        got = decision(cmd, **kw)
+        check(f"{want:5} {tag}{cmd!r}", got == want, got)
+
+
+def session(pixi=True, **kw):
+    out, err = run("session", {"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup"},
+                   pixi=pixi, **kw)
+    return out or {}, err
+
+
+def wrap_path(d, **kw):
+    e = env(True, **kw)
+    return subprocess.run(["sh", str(GUARD), "wrap-path", str(d)], capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, env=e).stdout.strip()
+
+
+def matrix():
+    """Run this file again under each awk / sh found, through PATH shims."""
+    shims = TMP / "shims"
+    variants = [("default", {})]
+
+    def which(*names):
+        for n in names:
+            p = shutil.which(n)
+            if p:
+                return p
+        return None
+
+    gawk, mawk, bbox, dash = which("gawk"), which("mawk"), which("busybox"), which("dash")
+    bwk = which("original-awk", "bwk-awk", "one-true-awk", "nawk")
+    if gawk:
+        variants += [("gawk", {"awk": [gawk]}), ("gawk --posix", {"awk": [gawk, "--posix"]})]
+    if mawk:
+        variants.append(("mawk", {"awk": [mawk]}))
+    if bbox:
+        variants.append(("busybox awk", {"awk": [bbox, "awk"]}))
+    if bwk:
+        variants.append(("bwk awk", {"awk": [bwk]}))
+    if dash:
+        variants.append(("dash", {"sh": [dash]}))
+        if gawk:
+            variants.append(("dash + gawk --posix", {"sh": [dash], "awk": [gawk, "--posix"]}))
+    bad = []
+    for name, tools in variants:
+        d = shims / re.sub(r"[^a-z0-9]+", "-", name)
+        d.mkdir(parents=True)
+        for tool, argv in tools.items():
+            f = d / tool
+            f.write_text("#!/bin/sh\nexec " + " ".join(f"'{a}'" for a in argv) + ' "$@"\n')
+            f.chmod(0o755)
+        e = dict(os.environ, PATH=f"{d}{os.pathsep}{os.environ['PATH']}", PIXI_GUARD_VARIANT=name)
+        print(f"=== {name}")
+        r = subprocess.run([sys.executable, __file__], env=e, capture_output=True, text=True)
+        lines = r.stdout.strip().splitlines() or ["(no output)"]
+        fails = [l for l in lines if l.startswith("  FAIL")]
+        print("\n".join(lines[:1] + fails + lines[-1:]))
+        if r.returncode:
+            bad.append(name)
+    print(f"\nmatrix: {len(variants) - len(bad)}/{len(variants)} variants green" + (f"; failed: {bad}" if bad else ""))
+    shutil.rmtree(TMP, ignore_errors=True)
+    return 1 if bad else 0
+
+
+if "--matrix" in sys.argv:
+    sys.exit(matrix())
+
+if os.environ.get("PIXI_GUARD_VARIANT"):
+    print(f"variant {os.environ['PIXI_GUARD_VARIANT']}: sh={shutil.which('sh')} awk={shutil.which('awk')}")
 
 
 print("scanner: refused")
-for cmd in [
+expect("deny", [
     "python x.py", "python3 -m venv .venv", "python3.12 -c 1", "pip install requests",
     "pip3 install -r requirements.txt", "uv sync", "uvx ruff check", "easy_install foo",
     "poetry install", "conda install numpy", "pipx install black", "pytest -q", "ipython",
@@ -83,12 +271,50 @@ for cmd in [
     "for f in a b; do python $f; done", "source .venv/bin/activate", ". venv/bin/activate",
     "brew install python@3.12", "brew install uv", "apt-get install -y python3-pip",
     "bash <<EOF\npip install x\nEOF", "python3 - <<'EOF'\nprint(1)\nEOF",
-    "cd /tmp\npython x", "X=1 Y=2 python x", "echo ok # fine\npip install x",
-]:
-    check(f"deny  {cmd!r}", decision(cmd) == "deny", decision(cmd))
+    "cd /tmp\npython x", "X=1 Y=2 python x", "echo ok # fine\npip install x", "pypy3 x.py",
+])
+
+print("review probes: refused")
+expect("deny", [
+    'PYTHONPATH="$PWD/src" python -m pkg', "PYTHONPATH='src' pytest -q", 'FOO="a b" pip install x',
+    "ls *.txt | xargs -I {} python {}", "xargs -I % python % < list", "xargs -d '\\n' python < list",
+    "env -u PYTHONPATH python x", "env -C sub python x", "env -S 'python3 -u' x",
+    "timeout -s KILL 5 python x", "timeout -k 5 10 pytest", "sudo -iu bob python x",
+    "command -p python3 x", "exec -a foo python x", "bash -o pipefail -c 'python x | tee log'",
+    "bash --rcfile /dev/null -c 'pip install x'", 'read a b <<< "$line"\npython x',
+    "cat <<< hi\npip install x", "2>/dev/null python x", ">out.log python x",
+    "(( n = 1 << 3 ))\npython x", "git commit -m \"$(cat <<'EOF'\nDon't break it\nEOF\n)\" && python x",
+    "watch -n 5 python x", "coproc python x", "su -c 'python x' me", "nice -n5 python x",
+    "sudo --preserve-env=PATH python x", "echo hi |& python -", "python3.12 x", "./.venv/bin/python x",
+    "VIRTUAL_ENV=.venv .venv/bin/pip install x", "exec python x", "nohup python x > log 2>&1 &",
+    "time -p python x", "builtin command python x", "\\python x", "p'y'thon x", "{ python x; }",
+    "f(){ python x; }; f", "case $x in a) python x;; esac", "diff <(pip freeze) req.txt",
+    "sudo -E env PATH=$PATH python x", "true && \\\npython x", "echo $((2*(3+4))) && python x",
+    "cat > f.py <<'EOF'\nprint(\"it's\")\nEOF\npython f.py", "uv run x.py", "ipython3",
+    "python -c \"print(')')\"; pip list",
+])
+
+print("review probes: allowed")
+expect("pass", [
+    "git commit -m \"$(cat <<'EOF'\nDon't use pip (it's slow)\n- run `pip install -e .` instead\nEOF\n)\"",
+    "gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\nSteps: 1) replace `pip install -e .` with `pixi install`\nEOF\n)\"",
+    "gh pr create --title t --body \"$(cat <<'EOF'\nFixed it :) now \"pixi\" works\npytest passes\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\nRemove pip; it's gone\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\nSwitch CI to pixi (it's faster than `pip install`)\nEOF\n)\"",
+    "brew info python", "brew list --versions python@3.12", "brew --prefix python@3.12",
+    "apt-get install -y pipewire", "apt install uvcdynctrl", "brew uses --installed python",
+    "brew install pixi", "ls /opt/python3/bin", "cd python && ls", "mkdir -p src/python",
+    "which python", "type python3", "command -v pip", "echo pip", "grep -rn \"import pip\" .",
+    "cat > x.py <<'EOF'\nimport os\nEOF\npixi run python x.py", "eval \"$(pixi shell-hook)\"",
+    "curl -fsSL https://pixi.sh/install.sh | sh", "pixi run -e dev pytest", "vim app.py",
+    "open notebook.py", "sed -i '' 's/python/pixi/' file", "export PYTHONPATH=src",
+    "docker run img python x", "ssh host python x", "rg -- -exec pip", "echo \"it's\" && echo `echo ok`",
+    "git log --grep='pip'", "echo hi # python x", "printf '%s\\n' \"a)b\" \"pip\"", "tr -d '()' < f",
+    "man python3", "brew install --cask docker", "brew install pinentry-mac",
+])
 
 print("scanner: allowed")
-for cmd in [
+expect("pass", [
     "pixi run python x.py", "pixi run pytest", "pixi add --pypi requests", "pixi exec python -V",
     "cd a && pixi run python x", "/opt/local/bin/pixi run python x", "git commit -m 'pip install x'",
     "git commit -m \"fix; python thing | uv\"", "echo python", "echo \"python x\"", "grep -r pip .",
@@ -98,16 +324,1291 @@ for cmd in [
     "cat <<-EOF\n\tpip install x\n\tEOF\necho done", "ruff check .", "node build.js",
     "echo ${PYTHON:-python}", "npm run python-docs", "brew install jq", "pixi run bash -c 'pip list'",
     "",
+])
+
+print("monitor and terminal tools")
+TERMINAL = "mcp__terminal__run_in_terminal"  # the desktop app's terminal tool; its input key is also "command"
+check("Monitor command is checked like Bash", decision("python3 -c 1", tool="Monitor") == "deny")
+check("Monitor near miss passes", decision("tail -f log | grep --line-buffered python", tool="Monitor") == "pass")
+check("terminal tool command is checked like Bash", decision("uvicorn app:app --reload; python manage.py runserver", tool=TERMINAL) == "deny")
+check("terminal tool: pixi run passes", decision("pixi run python manage.py runserver", tool=TERMINAL) == "pass")
+out, err = run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": "Monitor",
+                       "tool_input": {"ws": {"url": "wss://x"}, "description": "d", "timeout_ms": 1000}})
+check("Monitor without a command: no output", out is None and not err, (out, err))
+hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text())["hooks"]
+names = [n.strip() for n in re.split(r"[|,]", hooks["PreToolUse"][0]["matcher"])]
+check("PreToolUse matcher lists Bash, Monitor, the terminal tool and checkpoint's job_start",
+      {"Bash", "Monitor", TERMINAL, JOB} <= set(names) and re.fullmatch(r"[A-Za-z0-9_|]+", hooks["PreToolUse"][0]["matcher"]), names)
+
+print("hooks.json: exec form")
+for event, mode in (("SessionStart", "session"), ("PreToolUse", "pre")):
+    h = hooks[event][0]["hooks"][0]
+    args = [a.replace("${CLAUDE_PLUGIN_ROOT}", str(ROOT)) for a in h.get("args", [])]
+    check(f"{event} runs sh with args", h["command"] == "sh" and args[1:] == [mode] and Path(args[0]).is_file(), h)
+    payload = {"session_id": "s1", "cwd": str(PLAIN), "tool_name": "Bash", "tool_input": {"command": "pip list"}}
+    r = subprocess.run([h["command"], *args], input=json.dumps(payload), capture_output=True, text=True,
+                       env=env(True), cwd=str(TMP))
+    check(f"{event} hook runs as Claude Code would", r.returncode == 0 and r.stdout.strip().startswith("{"), r)
+
+print("checkpoint's job_start: its command, else its argv as /bin/sh gets it (checkpoint runs shlex.join(argv) with sh -c)")
+# A /bin/sh that is not bash (like dash, it has no --version), so a job reads as a Bash command with zsh as Claude
+# Code's shell (the default here); the real /bin/sh is bash 3.2 on macOS (see the bash 3.2 and 5.2 sections).
+NOBASH = TMP / "nobash" / "sh"
+NOBASH.parent.mkdir()
+NOBASH.write_text("#!/bin/sh\necho 'sh: 0: Illegal option --' >&2\nexit 2\n")
+NOBASH.chmod(0o755)
+JSH = {"PIXI_GUARD_JOB_SH": str(NOBASH)}
+JOB_PAIRS = [
+    # (command, the same as argv, decision)
+    ("python train.py", ["python", "train.py"], "deny"),
+    ("pixi run python train.py", ["pixi", "run", "python", "train.py"], "pass"),
+    ("python3 -u train.py --epochs 10", ["python3", "-u", "train.py", "--epochs", "10"], "deny"),
+    ("pixi run -e cuda python3 -u train.py", ["pixi", "run", "-e", "cuda", "python3", "-u", "train.py"], "pass"),
+    ("pytest -q tests", ["pytest", "-q", "tests"], "deny"),
+    ("pixi run pytest -q tests", ["pixi", "run", "pytest", "-q", "tests"], "pass"),
+    (".venv/bin/python train.py", [".venv/bin/python", "train.py"], "deny"),
+    ("/usr/bin/python3 train.py", ["/usr/bin/python3", "train.py"], "deny"),
+    ("env python train.py", ["env", "python", "train.py"], "deny"),
+    ("env CUDA_VISIBLE_DEVICES=0 pixi run python train.py", ["env", "CUDA_VISIBLE_DEVICES=0", "pixi", "run", "python", "train.py"], "pass"),
+    ("timeout 3600 python train.py", ["timeout", "3600", "python", "train.py"], "deny"),
+    ("timeout 3600 pixi run python train.py", ["timeout", "3600", "pixi", "run", "python", "train.py"], "pass"),
+    ("sudo -n pip install torch", ["sudo", "-n", "pip", "install", "torch"], "deny"),
+    ("nice -n 10 uv run train.py", ["nice", "-n", "10", "uv", "run", "train.py"], "deny"),
+    # a bare NAME=VALUE first is an assignment there too (shlex.join leaves it unquoted)
+    ("OMP_NUM_THREADS=4 python train.py", ["OMP_NUM_THREADS=4", "python", "train.py"], "deny"),
+    ("OMP_NUM_THREADS=4 pixi run python train.py", ["OMP_NUM_THREADS=4", "pixi", "run", "python", "train.py"], "pass"),
+    # code handed to a shell is read as code
+    ("sh -c 'python train.py'", ["sh", "-c", "python train.py"], "deny"),
+    ("bash -lc 'cd sub && pip install -e .'", ["bash", "-lc", "cd sub && pip install -e ."], "deny"),
+    ("bash -c 'pixi run python train.py'", ["bash", "-c", "pixi run python train.py"], "pass"),
+    # jobs that run no Python
+    ("make -j8 all", ["make", "-j8", "all"], "pass"),
+    ("cargo build --release", ["cargo", "build", "--release"], "pass"),
+    ("rsync -a data/ backup:data/", ["rsync", "-a", "data/", "backup:data/"], "pass"),
+    ("./build.sh --all", ["./build.sh", "--all"], "pass"),
+]
+for command, argv, want in JOB_PAIRS:
+    got = jdecision(command=command)
+    check(f"{want:5} job command {command!r}", got == want, got)
+    got = jdecision(argv=argv)
+    check(f"{want:5} job argv {argv!r}", got == want, got)
+# Each argv element is one word, quoted: shell syntax in it is text to /bin/sh. The same as a command runs.
+JOB_QUOTED = [
+    (["make", "&&", "python", "x"], "make && python x"),
+    (["true", "||", "pip", "install", "x"], "true || pip install x"),
+    (["echo", "$(pip list)"], "echo $(pip list)"),
+    (["echo", "`pytest`"], "echo `pytest`"),
+    (["echo", "done;", "python", "x"], "echo done; python x"),
+    (["echo", "a\npython x"], "echo a\npython x"),
+    (["echo", "it's", "|", "python"], "echo it\\'s | python"),
+    (["p'y'thon", "x"], "p'y'thon x"),
+]
+JSTUBS = "pip() { echo RAN >&2; }; python() { echo RAN >&2; }; pytest() { echo RAN >&2; }\n"
+for argv, command in JOB_QUOTED:
+    got = jdecision(argv=argv)
+    check(f"pass  job argv {argv!r}: one word each", got == "pass", got)
+    got = jdecision(command=command)
+    check(f"deny  job command {command!r}", got == "deny", got)
+    if argv[0] in ("echo", "true", "p'y'thon"):  # (harmless to run) /bin/sh, as checkpoint runs it, runs no Python either
+        r = subprocess.run(["/bin/sh", "-c", JSTUBS + shlex.join(argv)], capture_output=True, text=True, timeout=10,
+                           cwd=str(PLAIN), stdin=subprocess.DEVNULL)
+        check(f"/bin/sh runs nothing in shlex.join({argv!r})", "RAN" not in r.stderr, r.stderr)
+# argv reads exactly as Python's shlex.join(argv) does as a command.
+for argv in [a for _, a, _ in JOB_PAIRS] + [a for a, _ in JOB_QUOTED] + [
+    ["python", "it's here.py"], ["echo", ""], ["", "python"], ["echo", "a b", "c\td", "e\nf"],
+    ["python", "-c", "print('hi')"], ["echo", "\\", "\\'", "'", "''", "\"", "$", "${x:-python}", "~", "*", "?", "[a]", "{a,b}", "#", "!"],
+    ["env", "A=b c", "python"], ["A=1", "B=x y", "python"], ["PIXI_GUARD=ask", "pip", "list"], ["x=1", "pip"],
+    ["é", "python"], ["pythön"], ["sudo", "-u", "o'brien", "pip", "list"], ["sh", "-c", "echo 'it'\"'\"'s'; python x"],
+    ["bash", "-c", "git commit -m \"$(cat <<'EOF'\nDon't use pip (it's slow): `pip list`\nEOF\n)\""], ["a@b%c+d=e:f,g.h/i-j_K9", "pip"],
 ]:
-    check(f"pass  {cmd!r}", decision(cmd) == "pass", decision(cmd))
+    want = decision(shlex.join(argv))
+    got = jdecision(argv=argv, **JSH)
+    check(f"job argv {argv!r} reads as the command shlex.join makes of it ({want})", got == want, got)
+print("checkpoint's job_start: PIXI_GUARD=ask, refusals, no command")
+check("job: PIXI_GUARD=ask in front of the command asks", jdecision(command="PIXI_GUARD=ask python train.py") == "ask")
+check("job: PIXI_GUARD=ask as the first argv element asks", jdecision(argv=["PIXI_GUARD=ask", "python", "train.py"]) == "ask")
+check("job: PIXI_GUARD=ask before a job that runs no Python: no prompt", jdecision(argv=["PIXI_GUARD=ask", "make"]) == "pass")
+check("job: PIXI_GUARD=asked is not an override", jdecision(argv=["PIXI_GUARD=asked", "python", "x"]) == "deny")
+check("job: a quoted PIXI_GUARD=ask is not an override", jdecision(argv=["sh", "-c", "echo 'PIXI_GUARD=ask' && python x"]) == "deny")
+jws, jpy = TMP / "wsj", TMP / "pyj"  # a pixi workspace, and a Python project not on pixi
+jws.mkdir()
+(jws / "pixi.toml").write_text("[workspace]\n")
+jpy.mkdir()
+(jpy / "pyproject.toml").write_text("[project]\nname='p'\n")
+r = jreason(argv=["python", "train.py"], session_cwd=jws)
+check("job refusal in a pixi workspace: the pixi way, as the job's command (argv: pixi, run first)",
+      "make the job's command `pixi run python ...`" in r and '"pixi", "run" first' in r and "run it as" not in r, r)
+check("job refusal: PIXI_GUARD=ask in front of the job's command (argv: its first element)",
+      "`PIXI_GUARD=ask` in front of its command" in r and "first element" in r and "PIXI_GUARD=ask <command>" not in r, r)
+r = jreason(command="python train.py", session_cwd=jws)
+check("job refusal for a command: the pixi way, as the job's command", "make the job's command `pixi run python ...`" in r, r)
+r = jreason(argv=["pip", "install", "torch"], session_cwd=jws)
+check("job refusal for pip: pixi add, not pixi run pip", "pixi add" in r and "pixi run pip" not in r, r)
+r = jreason(argv=["pytest", "-q"], session_cwd=jpy)
+check("job refusal in a Python project not on pixi: the skill, then the job's command",
+      "pixi:project" in r and "Then make the job's command `pixi run pytest ...`" in r, r)
+r = jreason(argv=["pip", "install", "torch"], session_cwd=jpy)
+check("... for pip: the skill, then pixi add", "pixi:project" in r and "Then manage packages with `pixi add" in r and "pixi run pip" not in r, r)
+r = jreason(argv=["python", "train.py"])
+check("job refusal with no workspace: pixi exec as the job's command",
+      "No pixi workspace here" in r and "The job's command is then that pixi command, such as `pixi exec --spec python python ...`" in r, r)
+r = jreason(argv=["python", "x"], pixi=False, sid="jobm1")
+check("job refusal without pixi: PIXI_GUARD=ask in front of the job's command",
+      "tell the user" in r and "`PIXI_GUARD=ask` in front of its command" in r, r)
+check("job ask: names the job", "this job runs `python`" in jreason(argv=["PIXI_GUARD=ask", "python", "x"]))
+for d in (jws, jpy, PLAIN):
+    r = reason("python train.py", cwd=d)
+    check(f"Bash refusals say nothing of jobs ({d.name})", "job" not in r.replace(str(TMP), "") and "PIXI_GUARD=ask <command>" in r, r)
+check("Bash refusal in a workspace: run it as pixi run", "run it as `pixi run python ...`" in reason("python train.py", cwd=jws))
+check("Bash ask: names the command", "this command runs `python`" in reason("PIXI_GUARD=ask python x"))
+for label, kw in (("neither command nor argv", {}), ("an empty command and argv", {"command": "", "argv": []}),
+                  ("an empty argv", {"argv": []})):
+    out, err = job(**kw)
+    check(f"job with {label}: no output", out is None and not err, (out, err))
+check("job with an empty command: its argv is checked (checkpoint runs it then)", jdecision(command="", argv=["python", "x"]) == "deny")
+check("job argv: the elements before a non-string are checked", jdecision(argv=["python", None]) == "deny")
+check("job argv: a non-string first ends it (checkpoint can't run that)", jdecision(argv=[None, "python"]) == "pass")
+raw = ('{"session_id":"s1","cwd":' + json.dumps(str(PLAIN)) + ',"tool_name":"' + JOB + '","tool_input":{"name":"t","argv":'
+       '["\\u0070ython","\\/tmp\\/x \\"y\\"","a\\\\b\\tc"],"redo_hint":"r"}}')
+out, err = run("pre", None, raw=raw)
+check("job argv: JSON escapes decode (\\u0070ython is python)", verdict(out, err) == "deny" and "`python`" in why(out), (out, err))
+raw = ('{"session_id":"s1","cwd":' + json.dumps(str(PLAIN)) + ',"tool_name":"' + JOB + '","tool_input":{"name":"t","argv":'
+       '["echo","\\u0027; python x","\\"$(pip list)\\""],"redo_hint":"r"}}')
+out, err = run("pre", None, raw=raw)
+check("job argv: a decoded quote stays inside its word", verdict(out, err) == "pass", (out, err))
+h = hooks["PreToolUse"][0]["hooks"][0]
+r = subprocess.run([h["command"], *[a.replace("${CLAUDE_PLUGIN_ROOT}", str(ROOT)) for a in h["args"]]],
+                   input=json.dumps({"session_id": "s1", "cwd": str(PLAIN), "tool_name": JOB,
+                                     "tool_input": {"name": "t", "argv": ["pip", "install", "x"], "redo_hint": "r"}}),
+                   capture_output=True, text=True, env=env(True), cwd=str(TMP))
+check("job_start through hooks.json as Claude Code runs it: deny", r.returncode == 0 and '"deny"' in r.stdout, r)
+
+print("checkpoint's job_start: the job's cwd (a relative one from the session's)")
+jobs_dir = TMP / "jobs"
+pixi_x, plain_x = jobs_dir / "pixibang", jobs_dir / "plainbang"
+for d, line in ((pixi_x, "#!/usr/bin/env -S pixi exec --spec numpy -- python"), (plain_x, "#!/usr/bin/env python3")):
+    d.mkdir(parents=True)
+    (d / "x.py").write_text(line + "\nprint(1)\n")
+    (d / "x.py").chmod(0o755)
+for label, kw, want in (
+    ("a pixi #! line in the job's cwd (argv)", dict(argv=["./x.py"], cwd=pixi_x), "pass"),
+    ("a pixi #! line in the job's cwd (command)", dict(command="./x.py --fast", cwd=pixi_x), "pass"),
+    ("a python #! line in the job's cwd", dict(argv=["./x.py"], cwd=plain_x), "deny"),
+    ("the job's cwd counts, not the session's (python #! line in the job's)", dict(argv=["./x.py"], cwd=plain_x, session_cwd=pixi_x), "deny"),
+    ("the job's cwd counts, not the session's (pixi #! line in the job's)", dict(argv=["./x.py"], cwd=pixi_x, session_cwd=plain_x), "pass"),
+    ("a relative cwd, in the session's folder (pixi #! line)", dict(argv=["./x.py"], cwd="pixibang", session_cwd=jobs_dir), "pass"),
+    ("a relative cwd, in the session's folder (python #! line)", dict(argv=["./x.py"], cwd="plainbang", session_cwd=jobs_dir), "deny"),
+    ("no cwd: the session's (pixi #! line)", dict(argv=["./x.py"], session_cwd=pixi_x), "pass"),
+    ("no cwd: the session's (python #! line)", dict(argv=["./x.py"], session_cwd=plain_x), "deny"),
+    ("a cwd that does not exist: the session's (checkpoint refuses the job)", dict(argv=["./x.py"], cwd=jobs_dir / "nope", session_cwd=pixi_x), "pass"),
+):
+    got = jdecision(**kw)
+    check(f"{want:5} job ./x.py, {label}", got == want, got)
+out, err = run("pre", {"session_id": "s1", "cwd": str(plain_x), "tool_name": "Bash", "tool_input": {"command": "./x.py", "cwd": str(pixi_x)}})
+check("Bash: a cwd in its tool_input is not the command's folder (only a job's is)", verdict(out, err) == "deny", (out, err))
+jproj = jobs_dir / "proj"
+jproj.mkdir()
+(jproj / "pixi.toml").write_text("[workspace]\n")
+r = jreason(argv=["python", "train.py"], cwd=jproj)
+check("job refusal: names the pixi workspace of the job's cwd", f"{jproj} is a pixi workspace" in r, r)
+check("job refusal: not the session's folder", f"{jproj} is a pixi workspace" not in jreason(argv=["python", "train.py"], session_cwd=jproj, cwd=PLAIN))
+
+print("budget checks: a run over budget is measured once more, keeping the smaller time (machine load slows runs)")
+BURN = "import sys, time\nt = time.process_time()\nwhile time.process_time() - t < float(sys.argv[1]): pass\n"
+
+
+def runs(*plan):
+    """A function whose i-th call spends plan[i] = (CPU seconds in a child, seconds asleep) and returns i."""
+    calls = []
+
+    def fn():
+        c, s = plan[len(calls)]
+        if c:
+            subprocess.run([sys.executable, "-c", BURN, str(c)], check=True)
+        time.sleep(s)
+        calls.append(c)
+        return len(calls)
+    return fn
+
+
+n, c, _ = budgeted(runs((0.05, 0), (0.05, 0)), cpu=1)
+check(f"under budget: measured once ({c:.2f}s CPU)", n == 1 and c < 1, (n, c))
+n, c, _ = budgeted(runs((0.6, 0), (0.05, 0)), cpu=0.4)
+check(f"over budget, then under: measured twice, the smaller time kept ({c:.2f}s CPU)", n == 2 and 0.05 <= c < 0.4, (n, c))
+n, c, _ = budgeted(runs((0.6, 0), (0.6, 0)), cpu=0.4)
+check(f"over budget twice: still over ({c:.2f}s CPU)", n == 2 and c >= 0.6, (n, c))
+n, _, w = budgeted(runs((0, 1), (0, 0)), wall=0.8)
+check(f"over a wall-time budget, then under: measured twice, the smaller time kept ({w:.2f}s)", n == 2 and w < 0.8, (n, w))
+rs = remeasured(timed, runs((0, 0), (0, 0)), wall=0.3)
+check("under an upper wall-time bound: run once", [t[0] for t in rs] == [1], rs)
+rs = remeasured(timed, runs((0, 0.5), (0, 0)), wall=0.3)
+check(f"over it, then under: run twice, both results kept, first first ({rs[0][2]:.2f}s, {rs[-1][2]:.2f}s)",
+      [t[0] for t in rs] == [1, 2] and rs[0][2] >= 0.3 > rs[1][2], rs)
+rs = remeasured(timed, runs((0, 0.5), (0, 0.5)), wall=0.3)
+check("over it twice: still over", [t[0] for t in rs] == [1, 2] and min(t[2] for t in rs) >= 0.3, rs)
+
+print("checkpoint's job_start: big argv lists stay linear; a list too long to read is refused")
+for label, payload, want, big in (
+    ("80k words", dict(argv=["python"] + ["ab"] * 80000), "deny", False),
+    ("20k words with apostrophes", dict(argv=["echo"] + ["a'b c"] * 20000), "pass", False),
+    ("one 300KB word", dict(argv=["echo", "a" * 300000]), "deny", True),
+    ("100k words, 300KB", dict(argv=["make"] + ["ab"] * 100000), "deny", True),
+    ("PIXI_GUARD=ask, 300KB", dict(argv=["PIXI_GUARD=ask", "make"] + ["ab"] * 100000), "ask", True),
+    ("1.8MB of \\u escapes", '["echo","' + "\\u0061" * 300000 + '"]', "deny", True),
+    ("1.7MB of blanks in the list (cut before its ])", '["ls",' + " " * 1700000 + '"python"]', "deny", True),
+    ("1.7MB after the list's ]", '["ls"],"x":"' + "a" * 1700000 + '"', "pass", False),
+):
+    if isinstance(payload, str):
+        data = ('{"session_id":"s1","cwd":' + json.dumps(str(PLAIN)) + ',"tool_name":"' + JOB
+                + '","tool_input":{"name":"t","argv":' + payload + ',"redo_hint":"r"}}')
+        call = lambda: run("pre", None, raw=data)  # noqa: E731
+    else:
+        call = lambda: job(**payload)  # noqa: E731
+    (out, err), cpu, _ = budgeted(call)
+    got, r = verdict(out, err), why(out)
+    check(f"job argv, {label}: {want}{' (too large)' if big else ''}, {cpu:.2f}s CPU",
+          got == want and (("too large" in r) == big or want == "pass") and cpu < CPU, (got, r[:80]))
+
+print("assignments")
+expect("deny", ["X+=1 python x", "A='x y' B=\"$(pwd)\" pip list"])
+expect("pass", ["'PYTHONPATH=x' python", "PYTHONPATH=\"src\"python x", "FOO=python", "X=\"python x\"", "pkgs=(python pip); echo \"${pkgs[@]}\""])
 
 print("escalation")
 check("PIXI_GUARD=ask prefix asks", decision("PIXI_GUARD=ask python x") == "ask")
+check("PIXI_GUARD=\"ask\" asks", decision('PIXI_GUARD="ask" python x') == "ask")
+check("PIXI_GUARD='ask' asks", decision("PIXI_GUARD='ask' pip list") == "ask")
 check("ask on a later segment", decision("cd a && PIXI_GUARD=ask pip install x") == "ask")
-check("quoted PIXI_GUARD=ask is not an override",
-      decision("echo 'PIXI_GUARD=ask' && python x") == "deny")
+check("quoted PIXI_GUARD=ask is not an override", decision("echo 'PIXI_GUARD=ask' && python x") == "deny")
+check("PIXI_GUARD=asked is not an override", decision("PIXI_GUARD=asked python x") == "deny")
 check("ask reason names the program", "`pip`" in reason("PIXI_GUARD=ask pip install x"))
 check("deny reason explains the override", "PIXI_GUARD=ask <command>" in reason("python x"))
+
+print("heredocs in $(...)")
+msg = "Don't use pip (it's slow)\n- run `pip install -e .` instead\nSteps: 1) ok\n$(not run)"
+expect("pass", [
+    f"git commit -m \"$(cat <<'EOF'\n{msg}\nEOF\n)\"",
+    f"git commit -m \"$(cat <<'EOF'\n{msg}\nEOF)\"",
+    f"gh pr create --body \"$(cat <<-'EOF'\n\t{msg}\n\tEOF\n)\" --title t",
+    "x=$(cat <<'EOF'\nit's (fine\nEOF\n); echo \"$x\"",
+    "echo \"$(cat <<'A' <<'B'\nit's\nA\n(\nB\n)\"",
+    "echo $(echo hi # it's a comment\n) && ls",
+])
+expect("deny", [
+    f"git commit -m \"$(cat <<'EOF'\n{msg}\nEOF\n)\" && python x",
+    f"git commit -m \"$(cat <<'EOF'\n{msg}\nEOF)\" && pip list",
+    "x=$(cat <<'EOF'\nit's (fine\nEOF\n); python y",
+    "echo \"$(cat <<'EOF'\n)\nEOF\n)\" && pip list",
+    "echo $(echo hi # it's a comment\n) && python x",
+])
+
+print("heredoc bodies")
+expect("deny", [
+    "cat <<EOF\n$(pip freeze)\nEOF", "cat > r.txt <<EOF\n`pip --version`\nEOF",
+    "bash -s -- arg <<EOF\npython x\nEOF", "sh <<'EOF'\npip install x\nEOF",
+    "cat <<A; cat <<B\nx\nA\n$(python y)\nB", "cat <<EOF\nfine\nEOF\npython x",
+])
+expect("pass", [
+    "cat <<'EOF'\n`pip install x` and $(python y)\nEOF", "cat <<\"EOF\"\n$(python y)\nEOF",
+    "cat <<\\EOF\n$(python y)\nEOF", "cat <<EOF\nuse pip install x\nEOF", "cat <<EOF\n\\$(python y)\nEOF",
+    "cat <<EOF\n$(( 1 + 2 )) and ${HOME}\nEOF", "bash script.sh <<EOF\npython x\nEOF",
+    "echo \"$(bash <<'X'\necho hi\nX\n)\" \"$(<<'Y'\npip install x\nY\n)\"",
+])
+
+print("here-strings and arithmetic")
+expect("deny", ["python3 <<< 'print(1)'", "echo $(( 1 << 3 ))\npython x", "for ((i = 0; i < 3; i++)); do python x; done",
+                "((echo hi) ); python x", "echo $(( $(python -c 1) + 1 ))", "((n = $(pip list | wc -l)))"])
+expect("pass", ["echo $(( python + 1 ))", "(( pip = 1 ))", "echo \"$(( pip * 2 ))\"", "for ((python = 0; python < 3; python++)); do :; done",
+                "let \"x = 1 << 2\"", "echo $(( 1 << 3 ))\nls", "(( n = 1 << 3 ))\nls",
+                "x=$(( (1 + 2) * 3 ))", "cat <<< \"$(echo python)\""])
+
+print("wrapper options")
+expect("deny", [
+    "xargs -n1 -P4 python", "xargs -0 -I{} python {}", "xargs --max-args 1 python", "xargs -i python {}",
+    "env -S python3 x", "env --split-string='pip list'", "env -iS 'pip install' x", "env - python x",
+    "env --chdir sub python x", "env -- python x", "sudo -u bob -g staff python x", "sudo -ubob python x",
+    "sudo -- python x", "sudo -Eu bob python x", "sudo -nHu bob pip list", "doas -u bob python x", "timeout --signal KILL 5 python x", "gtimeout -k5 10 pytest",
+    "nice -5 python x", "nice --adjustment 5 python x", "ionice -c 3 python x", "stdbuf -o L python x",
+    "stdbuf -oL python x", "caffeinate -t 60 python x", "arch -x86_64 python x", "arch -arch x86_64 python x",
+    "exec -c python x", "command -- python x", "time -f %e python x", "busybox sh -c 'python x'",
+    "bash -euo pipefail -c 'python x'", "bash -O extglob -c 'python x'", "bash +o posix -c 'python x'",
+    "bash --init-file f -c 'python x'", "zsh -o errexit -c 'pip list'", "sh -c -- 'python x'",
+    "bash -c -x 'python x'", "fish -c 'python x'", "fish --command='pip list'", "fish -C 'pip list'",
+    "watch 'pip list | head'", "watch -n 2 -- python x", "su - bob -c 'python x'", "su --command='pip list' bob",
+    "runuser -u bob -- sh -c 'python x'", "sudo sh -c 'pip install x'",
+    "runuser -u bob python x", "runuser -u bob -g staff pip list", "runuser --user=bob python x",
+    "runuser --user bob -- python x", "runuser -ubob python x", "runuser -l bob -c 'python x'",
+    "su -s /bin/bash -c 'pip list' bob", "su -lc 'python x' bob",
+])
+expect("pass", [
+    "timeout 5 grep python log", "xargs grep python", "env | grep python", "nice -n 5 make",
+    "command -pv python", "exec -a python make", "sudo -e setup.py", "sudo -l python", "xargs -I python echo hi",
+    "watch -n 5 ls", "su -c 'pixi run python x' me", "bash script.sh", "bash -x deploy.sh",
+    "sh -c 'pixi run pytest'", "env -u PYTHONPATH make", "stdbuf -oL make", "time -p make", "env -S echo 'a;python x'",
+    "env -S echo \"it's;python x\"", "runuser -u bob ls", "runuser -l bob -c 'ls'", "su -s /bin/bash -c 'ls' bob",
+    "su - python",
+])
+
+print("redirections")
+expect("deny", ["2>&1 >/dev/null python x", "{fd}>log python x", "</dev/null pip list", "&>/dev/null python x",
+                "exec 3>&1; python x", "python x 2>/dev/null", ">>log 2>&1 pip install x"])
+expect("pass", ["echo 2>/dev/null python", "ls >python.log", "cat <python.txt", "exec 3>&1"])
+
+print("package managers")
+expect("deny", [
+    "brew install python", "brew reinstall python@3.12", "brew upgrade pyenv", "brew install --cask miniconda",
+    "sudo apt install python3", "apt-get -y install python3-venv", "apt -o Debug=1 install python3",
+    "dnf install -y python3.11", "yum install python3-pip", "pacman -S python", "pacman -Syu python-pip",
+    "zypper in python311", "apk add py3-pip", "nix-env -iA nixpkgs.python3", "port install py312-numpy",
+    "winget install -e --id Python.Python.3.12", "choco install python", "scoop install python",
+    "brew install pyenv-virtualenv", "brew install homebrew/core/python@3.11", "apt install python3=3.11.2-1",
+])
+expect("pass", [
+    "apt list --installed python3", "apt search python3", "apt-cache show python3", "dnf info python3",
+    "pacman -Ss python", "pacman -Si python", "pacman -Qi python", "port search python", "brew upgrade",
+    "brew install pipe-viewer", "apt install pipewire-audio", "brew install uvwasi", "apt install condor",
+    "brew install pyright-langserver-not-py", "nix-env -q python3", "brew search python",
+])
+
+print("venv and conda console scripts")
+expect("deny", ["./.venv/bin/uvicorn app:app", "venv/bin/flask run", ".venv/bin/gunicorn -w 4 app",
+                "~/miniconda3/bin/flask run", "/opt/miniforge3/envs/x/bin/streamlit run a",
+                "~/.virtualenvs/proj/bin/celery worker", "/home/me/proj/.venv311/bin/alembic upgrade head"])
+expect("pass", ["ls .venv/bin/", "cat venv/bin/activate", "rm -r .venv", "ls ~/miniconda3/bin"])
+
+print("find / fd / git")
+expect("deny", ["find . -execdir python {} \\;", "find . -ok pip show {} \\;", "gfind . -exec pytest {} +",
+                "find . -exec sh -c 'python \"$1\"' _ {} \\;", "fd -e py -x black {}", "fd . -X pytest",
+                "fd --exec-batch python {}", "fd -x sh -c 'pip install {}'", "git rebase -i --exec 'python x' main",
+                "git rebase -x 'pytest -q' main", "git rebase --exec='pip list' main", "git bisect run python t.py"])
+expect("pass", ["rg -- -exec pip", "grep -e -exec python", "find . -exec echo python {} \\;", "find . -name '*.py'",
+                "fd -e py", "git rebase -i main", "git rebase --exec 'pixi run pytest' main", "git log -x python",
+                "git bisect start"])
+
+print("other syntax")
+expect("deny", ["echo ${X:-$(python -V)}", "$'python' x", "$\"python\" x", "echo \"`pip list`\"",
+                "a=(python pip); python x", "x=$(python -V)", "if [[ -f x ]]; then pip list; fi",
+                "while read l; do python \"$l\"; done < f", "! python x", "until python x; do :; done"])
+expect("pass", ["echo $'it\\'s' python", "echo '$(python x)'", "echo \\$PATH python", "echo $#", "echo ${#x} python",
+                "echo {python,pip}", "printf '%s\\n' \"$(echo ')')\""])
+
+print("$'...' inside $(...)")
+expect("pass", ["echo $(printf $'it\\'s') pip", "echo \"$(printf $'it\\'s') pip\"", "a=($'it\\'s' \"b)c\"); echo ok",
+                "x=$(printf $'a)b'); echo \"$x\""])
+expect("deny", ["x=$(printf $'it\\'s'); python x", "echo $(printf $'it\\'s'; pip list)", "a=($'it\\'s' $(pip list))",
+                "echo ${x:-$'it\\'s'}; python y"])
+
+print("heredocs piped into a shell")
+expect("deny", ["cat <<EOF | bash\npip install x\nEOF", "cat <<'EOF' | sh\npython x\nEOF",
+                "cat <<EOF |& sudo bash -s\npip list\nEOF", "cat <<EOF | grep -v '^#' | bash\npip list\nEOF",
+                "cat <<'A' | cat - <<'B' | bash\nls\nA\npython x\nB", "cat <<'EOF' | bash -s -- a\npython x\nEOF"])
+expect("pass", ["cat <<EOF | grep pip\npip install x\nEOF", "cat <<'EOF' | tee f.txt\npython x\nEOF",
+                "cat <<EOF || bash x.sh\npip install x\nEOF", "cat <<EOF; bash x.sh\npip install x\nEOF",
+                "cat <<EOF | bash x.sh\npip install x\nEOF", "cat <<EOF && bash\npip install x\nEOF",
+                "cat <<EOF || bash\npip install x\nEOF"])
+
+print("here-strings into a shell")
+expect("deny", ["bash <<< 'pip install x'", "sh <<< \"python x\"", "bash -s <<< 'pip list'", "<<< 'pip list' bash",
+                "sudo bash <<< 'python x'"])
+expect("pass", ["bash <<< 'echo hi'", "cat <<< 'pip install x'", "bash script.sh <<< 'pip'", "grep -c pip <<< \"$x\""])
+
+print("${...} quoting")
+expect("deny", ["echo ${x:-\"}\"}; python y", "echo \"${x:-'}'}\"; python y", "echo \"${x:-'$(python x)'}\"",
+                "echo ${x:-\"$(python x)\"}", "echo ${x:-`pip list`}"])
+expect("pass", ["echo ${x:-'$(python x)'}", "echo ${x:-\"}\"} pip", "echo \"${x:-'}'}\" pip", "echo ${x//\\}/python}"])
+
+print("$[...], nested backticks, brace expansion")
+expect("deny", ["echo $[1<<2]\npython x", "echo $(echo $[1<<2]\npython x)", "echo `echo \\`python x\\``",
+                "echo `echo \\$(pip list)`", "{python,pip} x", "py{thon,} x", "{python,}3 -c 1"])
+expect("pass", ["echo $[1<<2]\nls", "echo `echo \\\\$HOME` pip", "echo `printf 'a\\\\nb'` pip", "echo {python,pip}",
+                "ls {a,b}.txt", "a=('$(python x)' b); echo \"${a[@]}\""])
+expect("deny", ["a=(\"$(python x)\" b)"])
+
+print("case statements")
+expect("pass", [
+    "echo $(case $x in a) echo 1;; esac) pip", "case $x in pip|uv) echo hi;; python) ls;; esac",
+    "case \"$t\" in\n  pip) echo a ;;\n  (uv|poetry) echo b ;;\n  *) echo c ;;\nesac",
+    "x=$(case $t in pip) echo 1;; (uv) echo 2;; *.@(py|sh)) echo 3;; esac); echo \"$x\"",
+    "echo \"$(case $t in pip) echo 1;; esac)\" pip", "case $x in a) echo;;& b) echo;& pip) echo;; esac",
+    "case $x in\n# a comment with pip)\npip) echo;;\nesac", "case $x in\na) echo;;\nesac",
+])
+expect("deny", [
+    "case $x in a) python x;; esac", "case $x in pip) echo;; esac; python x", "case $x in a) echo;; esac\npip list",
+    "echo $(case $x in a) python x;; esac)", "echo $(case $x in a) echo 1;; esac) && pip list",
+    "x=$(case $t in pip) echo 1;; esac); python y", "case $(python -V) in a) echo;; esac",
+    "case $x in $(pip list)) echo;; esac", "case $x in a) bash <<EOF;;\npython x\nEOF\nesac",
+    "case $x in a) echo;; b) pip install x;; esac", "case x in a) ls\nesac\npython x", "echo case x in a) ; python x",
+    "if true; then case $x in a) python y;; esac; fi", "echo $(echo case in a) && pip list",
+    "case $x in a) echo;; esac&&python x",
+])
+
+print("a case pattern with no \")\" is a syntax error, not a command")
+expect("pass", ["case $t in pip", "case $t in\npip", "echo $(case x in pip)"])
+expect("deny", ["case $t in pip) ;; esac; pip list", "case $t in pip) ;; esac\npython3 x", "case $t in a) python3 x;; pip"])
+
+print("[[ ... ]]")
+expect("pass", ["[[ $x =~ ^(pip|uv)$ ]] && echo y", "if [[ $t =~ (python|pip)[0-9]* ]]; then echo y; fi",
+                "[[ $x =~ (a|b) ]] || [[ $y =~ (pip|uv) ]]", "! [[ $x =~ (pip) ]] && ls"])
+expect("deny", ["[[ $x =~ (a|b) ]] && python x", "[[ $(python -V) == x ]]", "[[ a < b ]] && pip list",
+                "[[ x ]] || python x", "[[ x ]] | python", "[[ x ]]\npython x", "echo [[ | python x"])
+
+print("[[ ... ]] ends at an operator")
+expect("deny", ["[[ -n x ]]|python3 z", "[[ -n x ]]>/dev/null; echo | python3 z", "[[ -n x ]]</dev/null; echo | python3 z",
+                "([[ -n x ]]); (python3 z)", "echo ok; [[ -n x ]]|python3 -c \"print(777)\"", "[[ -n x ]]||python3 z",
+                "case x in [[) echo;; esac; python3 z", "case x in [[) echo;; *) python3 z;; esac",
+                "case x in [[ | a) echo;; esac | python3 z",
+                # where [[ is not a keyword (dash): an unmatched ")", or a ; & newline, ends it too
+                "([[ -n x ) || (python3 z)", "[[ -n x]]; echo | python3 z", "[[ -n $[ ]]\necho 'python3 z' | sh"])
+expect("pass", ["[[ -n x ]]>/dev/null; cat <<E\npip\nE", "[[ $x =~ ^(pip|uv)$ ]]&&echo y", "case x in [[) echo pip;; esac",
+                "[[ ( -n x ) && ( -z y ) ]] && echo pip", "[[ -n x && $y =~ (pip|uv) ]] && echo ok"])
+
+print("${...}: where bash, zsh and dash end it")
+expect("deny", [
+    # bash: single quotes count in "${...}"
+    "x=; echo \"${x:-'}\"'}\"; python3 z", "x=; echo \"${x:-'\"'}\"; python3 z",
+    # zsh and dash: they do not
+    "x=; echo \"${x:-'}\"; python3 z", "x=$(echo \"${x:-'}\"; python3 z)", "x=; echo \"${x:-$'}'}\"; python3 z",
+    # bash and dash: a bare { does not nest; zsh: it does
+    "echo ${x:-{}; python3 y", "echo ${x:-{} #}; python3 z",
+    # in $(...): ${...} is skipped whole (bash 5, zsh, dash)
+    "x=$(echo \"${x:-\")'\"}\"; python3 z; echo \"'\")", "x=$(echo ${x:-) #}; python3 z)",
+])
+expect("pass", ["echo \"${VAR:-'none'}\" pip", "echo ${x:-{}} pip", "echo \"${DATA:-{}}\" | jq . && echo pip",
+                "x=\"$(echo \"${HOME:-'none'}\")\" && echo pip", "x=$(echo \"${x:-\")\"}\") && echo pip",
+                "x=$(echo ${x:-$(pwd)} ${x#*/}) && echo pip"])
+
+print("heredoc delimiters over 256 characters")
+for q in ("", "'"):
+    d = "D" * 300
+    r = reason(f"cat <<{q}{d}{q}\nx\n{d}\npython3 x")
+    check(f"300-character {'quoted ' if q else ''}delimiter is too complex", "too large" in r, r)
+d = "D" * 256
+expect("pass", [f"cat <<{d}\npip install x\n{d}\nls"])
+expect("deny", [f"cat <<{d}\nx\n{d}\npython3 x"])
+
+print("code piped into a shell")
+expect("deny", [
+    "cat <<EOF |\npython3 z\nEOF\nbash", "cat <<EOF |\n\npip list\nEOF\n\nbash", "cat <<EOF | # c\npip list\nEOF\nbash",
+    "(cat <<EOF) | bash\npython3 z\nEOF", "(cat <<EOF) 2>/dev/null | bash\npip list\nEOF", "{ cat <<EOF; } | bash\npython3 z\nEOF",
+    "(cat <<EOF; echo) | sh\npip list\nEOF", "cat <<EOF | (bash)\npython3 z\nEOF", "cat <<EOF | { bash; }\npython3 z\nEOF",
+    "cat <<EOF | (cd /tmp && bash)\npip list\nEOF",
+    "printf 'pip install x\\n' | sh", "echo 'python3 z' | bash", "printf '%s\\n' 'pip list' | sh", "echo -e 'ls\\npip list' | sh",
+    "(echo pip list) | bash", "echo pip list | (bash)", "{ echo pip; } | sh", "echo pip | sudo sh -s",
+])
+expect("pass", [
+    "cat <<EOF |\npip install x\nEOF\ngrep pip", "(cat <<EOF; bash x.sh) | grep x\npip\nEOF", "{ cat <<EOF; } > f\npip\nEOF\nbash x.sh",
+    "(cat <<EOF)\npip\nEOF\necho | bash", "cat <<EOF &&\npip list\nEOF\nbash x", "echo pip | grep pip",
+    "echo 'pip install x' | bash script.sh", "echo pip; bash x.sh", "(echo pip) | grep x", "printf -v x 'pip list' | sh",
+])
+
+print("brace expansion: every word")
+expect("deny", ["{,python3} x", "{,python3,} x", "{a,python3} x"])
+expect("pass", ["echo {,python3} x", "ls {,a}"])
+
+print("$[ without its ], for dash; extglob in case patterns")
+expect("deny", ["echo $[ ; python3 x", "echo $(echo $[) ; python3 x", "{ echo $[; } | cat;echo `echo ]]`&`python3 z`",
+                "case x in @($(python3 z))) ;; esac", "case x in @(a|`pip list`)) ;; esac"])
+expect("pass", ["echo $[ 1 + 2 ] pip", "case $t in @(pip|uv)) echo y;; esac", "case $t in @('$(pip)')) echo y;; esac"])
+
+print("$((...)) that is $( (...) ), and arrays with operators")
+expect("deny", ["cat <<E\n$((cat <<F) | sh\npython3 z\nF\n)\nE", "a=(<(python3 z))", "a=(x <(pip list) y); echo ok",
+                "x=(a && b\npython3 z\n)"])
+expect("pass", ["cat <<E\n$(( 1 + 2 ))\nE", "a=('a;b' \"c|d\" e\\;f); echo \"${a[@]}\" pip"])
+
+print("{ and }: only whole words in command position open or close a group")
+expect("deny", [
+    # "}#" is a plain word in every shell: the "#" does not start a comment
+    "echo }#; python3 z", "printf '%s\\n' a }#b; pip list", "echo a; }#; python3 z", "for i in }#; do python3 z; done",
+    "case }# in *) python3 z;; esac", "echo \"$(echo }#; python3 z)\"", "cat <<E\n$(echo }#; python3 z)\nE",
+    # a group after time, coproc, function NAME
+    "time { python3 z; }", "time -p { python3 z; }", "function f { python3 z; }; f", "coproc N { python3 z; }",
+    "! { python3 z; }", "x || { pip list; }", "{ cat <<E; } | bash\npython3 z\nE",
+    # zsh: a "}" before a blank or an operator closes an open group anywhere
+    "{ cat <<E; echo }|bash\npython3 z\nE", "{ cat <<E; echo a}|bash\npython3 z\nE", "{ cat <<E; >/dev/null }|bash\npython3 z\nE",
+])
+expect("pass", ["echo }", "echo }#x", "echo { a }", "echo } python3 z", "echo { python3 z", "echo {a,b} } pip",
+                "find . -exec echo {} \\;", "{fd}>log echo python", "{ echo a; } >/dev/null; echo pip"])
+
+print("heredoc delimiters bash and zsh read as other words")
+for d in ("$'EOF'", "$'E\\x4fF'", '$"EOF"', "$(echo)", "$((1))", "a$(echo)b", "${x:-a b}", "$[1 ]", "`a b`",
+          "a=(b)", "@(a)"):
+    r = reason(f"cat <<{d}\nhi\nEOF\n{d}\npython3 z")
+    check(f"<<{d}: too complex", "too large" in r, r)
+check("$'...' delimiter inside $(...): too complex", "too large" in reason("x=$(cat <<$'EOF'\nhi\nEOF\n); python3 z"))
+expect("pass", ["cat <<$EOF\nhi\n$EOF\nls", "cat <<'$(x)'\npip\n$(x)\nls", "cat <<E$x\npip\nE$x\nls"])
+
+print("shells reading /dev/stdin or <(...), and source of them")
+expect("deny", [
+    "bash /dev/stdin <<'E'\npython3 z\nE", "bash /dev/fd/0 <<'E'\npython3 z\nE", "cat <<'E' | bash /dev/stdin\npython3 z\nE",
+    "echo \"python3 z\" | sh /dev/stdin", "sh /proc/self/fd/0 <<< 'pip list'", "bash -- /dev/stdin <<'E'\npip list\nE",
+    ". /dev/stdin <<'E'\npython3 z\nE", "source /dev/stdin <<'E'\npython3 z\nE",
+    "bash <(echo 'python3 z')", "bash <(cat <<'E'\npython3 z\nE\n)", ". <(printf 'pip list\\n')", "source <(echo 'python3 z')",
+    "bash < <(echo python3 z)", "sh -s < <(printf 'pip list')", "bash <(echo ls; (echo 'pip list'))",
+    "cat <<< 'python3 z' | bash", "(cat <<< 'pip list') | sh",
+])
+expect("pass", [
+    "bash /dev/stdin.sh <<'E'\npython3 z\nE", "bash script.sh <(echo 'python3 z')", "diff <(echo python3 z) f",
+    "source <(pixi shell-hook)", "cat <<< 'python3 z' | grep x", "bash \"$(echo x.sh)\" <<'E'\npython3 z\nE",
+    "cat <(echo pip) | grep p", "source ~/.bashrc", "bash < /dev/null", "bash < <(echo ls)",
+])
+
+print("literal code handed to a shell through $(...)")
+expect("deny", ["bash -c \"$(cat <<'E'\npython3 z\nE\n)\"", "eval \"$(cat <<'E'\npython3 z\nE\n)\"",
+                "bash <<<\"$(cat <<'E'\npython3 z\nE\n)\"", "sh -c \"$(echo 'pip list')\"", "su -c \"$(echo pip list)\" me"])
+expect("pass", ["eval \"$(pixi shell-hook)\"", "bash -c \"$(cat script.sh)\"", "eval \"$(ssh-agent -s)\"",
+                "git commit -m \"$(cat <<'E'\npython3 z\nE\n)\"", "bash -c \"$(printf %s ls)\"", "echo \"$(echo pip)\" | grep p"])
+
+print("arrays: a ( or an operator in them, after which bash goes on at the next line")
+expect("deny", [
+    "a=( (a) \"\npython3 z\n\"", "fia=( cat[[ x =~ (a) ]] \\'\"\\'\npython3 z cat", "a=( ; ) \"\npython3 z\n\"",
+    "a=( ; x ) <<E\npython3 z\nE", "a=( ; x ) echo \\\npython3 z", "a=( (a) x\npython3 z",
+])
+expect("pass", ["a=(1 2 \"(x)\")", "pkgs=(\n  pip # (the installer); x\n  uv\n); echo \"${pkgs[@]}\"", "a=(<(echo a; b)\n)\necho pip",
+                "a=(x)\necho pip"])
+
+print("zsh readings")
+expect("deny", ["{python3 z}", "{python3 z;}", "=python3 z", "repeat 1 python3 z", "if [[ -n x ]] python3 z",
+                ">! out python3 z", ">>! out python3 z", "2>! out python3 z", "&>! out python3 z", "- python3 z",
+                "a=(1)python3 z",
+                # bash's reading is kept: ">!" is ">" to a file "!", and a=(1)z is one word
+                ">! python3 z", "a=(1)z python3"])
+expect("pass", ["echo =python3", ">!out echo python3", "{a,b}c d", "repeat_it 1 python3", "echo repeat 1 python3",
+                "[[ -n x ]] && echo pip"])
+
+print("a first word that can expand to nothing")
+expect("deny", ["$SUDO pip install requests", "$(true) python3 z", "`true` python3 z", "\"$@\" python3 z",
+                "${x:+} python3 z", "\"${args[@]}\" pip list", "$x $y python3 z", "$x >/dev/null python3 z",
+                "echo \"python3 z\" | ${x:+}sh", "$SHELL -c 'python3 z'", "echo 'python3 z' | $SHELL", "$SUDO apt install python3"])
+expect("pass", ["$EDITOR notes.md", "$(command -v pixi) run python x", "\"$x\" python3", "${PIXI:-pixi} run python x",
+                "$x", "\"$@\"", "$HOME/.pixi/bin/pixi run python x", "\"$1\" pip", "$SUDO make install"])
+
+print("brace expansion: several groups, nested, ranges")
+expect("deny", ["{python3,}{,python3}", "{{python3,x},y} a", "{,} python3 z", "{p..p}ython3 z", "python{3..3} z",
+                "{python3,{x}} z", "{python3,x}{,} z", "{x,{y,{z,pip}}} list"])
+expect("pass", ["echo {python3,}{,python3}", "ls {1..3}", "{a..c} x", "{a,b}{c,d} x", "echo {1..9999}"])
+check("brace expansion into over 256 words is too complex", "too large" in reason("{1..1000} x"))
+
+print("brace expansion of words with quotes (bash expands braces before removing quotes)")
+expect("deny", ["{'python3',-V}", "{\"python3\",-V}", "{\\python3,-V}", "{py\\thon3,-V}", "{'py'thon3,}",
+                "{'pip',} -V", "env {'python3',-V}", "p{'y',}thon3 -V"])
+expect("pass", ["'{python3,x}'", "\"{\"python3,x}", "echo {'python3',x}", "\"{python3,}\" x"])
+
+print("a program word that is ${NAME:-WORD}: WORD may be the program")
+expect("deny", ["${PYTHON:-python3} -c 1", "\"${PYTHON:-python3}\" -c 1", "${PIP:-pip} install x", "${x-python3} -V",
+                "${x:=python3} -V", "\"${x:-pip}\" -V", "${x:-python3}", "${PYTHON:-python3} -m pytest",
+                "${x:+python3} -V", "${SUDO:-sudo} pip install x", "${x:+sudo} python3 z", "${a:-${b:-python3}} x",
+                "${SH:-bash} -c 'python3 z'", "echo 'pip list' | ${SH:-sh}", "env ${PY:-python3} x",
+                "${PY:-/usr/bin/python3} x", "${PY:-'python3'} x", "${SH:-sh} <<'E'\npip list\nE",
+                "find . -exec ${PY:-python3} {} \\;"])
+expect("pass", ["${EDITOR:-vim} f.py", "\"${EDITOR:-vim}\" notes.py", "'${x:-pip}' -V", "${CC:-cc} -o x x.c",
+                "\"${PIXI:-pixi}\" run python x", "echo ${PYTHON:-python3}", "${x:-} ls", "${x:?python3} ls"])
+
+print("a program word with ${NAME:-WORD} in it: also read with each WORD, other expansions dropped")
+expect("deny", ["${VIRTUAL_ENV:-.venv}/bin/uvicorn app:app", "${PYTHON:-python}${PYVER} -V", "${PY:-python}3 -V",
+                "\"${VIRTUAL_ENV:-.venv}/bin/uvicorn\" app", "\"${PY:-python}\"3 -V", "${PY:-python}${V:-3} -V",
+                "${VENV:-$HOME/.venv}/bin/pip install x", "\"${VENV_DIR:-$HOME/.venv}/bin/python\" x", "${PY-python}3 -V",
+                "${PY=python}3 -V", "${PY:=python}3 -V", "${PY:+python}3 -V", "${PY+python}3 -V", "${a:-${b:-python}}3 -V",
+                "${1:-python}3 -V", "${arr[0]:-python}3 -V", "${PY:-'python'}3 -V", "${A:-x}python3 z",
+                "env ${PY:-python}3 -V", "${RUN:-env}${X} PYTHONPATH=. ${PY:-python}3 x"])
+expect("pass", ["${EDITOR:-vi} file", "${CC:-cc}${SUFFIX} -o x x.c", "${TOOLS:-./tools}/build.sh", "${NODE:-node}${V} app.js",
+                "echo ${PY:-python}3", "'${PY:-python}'3 -V", "${PIXI:-pixi}${X} run python x", "${x:-a}}python3 z",
+                "${PY:-py thon}3 -V", "${x:-", "${x:?python}3 -V", "${x:-}${y} ls", "${GIT:-git}${X} commit -m 'pip'"])
+
+print("expansions dropped from a program word")
+expect("deny", ["${a}${b}python3 z", "$a$1$@python3 z", "$(true)``python3 z", "${x:-}python3 z", "${x:-a}$y/python3 z"])
+expect("pass", ["${a}${b}ls python3", "$(true)``ls python3", "${x:-a}}python3 z"])
+
+print("wrappers: setsid, flock, strace, xvfb-run, taskset, chrt, lockf, script, sandbox-exec, direnv, mise, asdf")
+expect("deny", [
+    "setsid python3 app.py", "setsid -f python3 app.py", "flock /tmp/l python3 x", "flock -w 5 /tmp/l pip list",
+    "flock -n /tmp/l -c 'python3 x'", "strace -f python3 x", "strace -o log -e trace=open python3 x", "ltrace python3 x",
+    "xvfb-run python3 x", "xvfb-run -a -s '-screen 0 1024x768x24' pytest", "xvfb-run --server-args '-ac' python3 x",
+    "taskset -c 0 python3 x", "taskset 0x1 python3 x", "chrt -f 10 python3 x", "lockf -k f python3 -V",
+    "lockf -t 5 f pip list", "script -q /dev/null python3 -V", "script -q -c 'python3 x' /dev/null",
+    "script --command='pip list' log", "sandbox-exec -p '(version 1)(allow default)' python3 -V",
+    "sandbox-exec -f prof.sb pip list", "direnv exec . python3 x", "mise exec -- python3 x",
+    "mise x python@3.12 -- python x", "mise exec -c 'pip list'", "asdf exec python3 x",
+])
+expect("pass", ["taskset -p 1234", "taskset -pc 0 1234", "chrt -p 1234", "flock 9", "script log.txt", "direnv allow",
+                "mise use python@3.12", "mise exec node -- node app.js", "setsid -f make", "strace -c ls",
+                "flock /tmp/l -c 'pixi run python x'", "xvfb-run pixi run pytest"])
+
+print("screen, tmux, trap")
+expect("deny", [
+    "screen -dmS s python3 app.py", "screen -dm bash -c 'python3 app.py'", "screen -S s -X stuff 'python3 app.py\\n'",
+    "tmux new -d 'python3 app.py'", "tmux new -d python3 app.py", "tmux new-session -d -s srv 'pip install x'",
+    "tmux split-window -h 'pytest -f'", "tmux send-keys -t srv 'pip install x' Enter", "tmux -L x new -d 'python3 app.py'",
+    "tmux if-shell 'python3 -c 1' 'display ok'", "tmux new -d \\; send-keys 'python3 x' Enter", "tmux -c 'pip list'",
+    "tmux run-shell -b 'python3 x'", "trap 'python3 -V' EXIT", "trap -- 'pip list' INT", "trap \"$(echo python3)\" EXIT",
+])
+expect("pass", ["screen -ls", "screen -r s", "screen -S s -X quit", "tmux ls", "tmux attach -t s",
+                "tmux new -d 'pixi run python app.py'", "tmux new -d pixi run python app.py", "tmux send-keys -t s 'ls' Enter",
+                "trap 'rm -f x' EXIT", "trap -p", "trap - EXIT", "echo trap python3"])
+
+print("xargs running a shell: its code may come from stdin")
+expect("deny", ["echo 'pip -V' | xargs -0 sh -c", "echo python3 | xargs sh -c", "printf 'python3 -V' | xargs -I{} sh -c '{}'",
+                "echo 'pip list' | xargs -J % sh -c 'cd /tmp && %'",
+                "echo 'pip list' | xargs -I % bash -c 'echo hi; %'", "echo 'pip list' | xargs --replace bash -c '{}'",
+                "echo 'pip list' | xargs -i bash -c '{}'", "xargs sh -c <<< 'python3 z'"])
+expect("pass", ["echo a | xargs sh -c 'echo $1' _", "echo python3 | xargs -I{} sh -c 'echo {}' | grep x", "echo pip | xargs echo",
+                "printf '%s\\n' a.py b.py | xargs -I{} sh -c 'wc -l {}'", "echo pip | xargs -I% sh -c 'echo %; ls'"])
+
+print("output into a >(...) that is a shell reading stdin")
+expect("deny", ["echo 'python3 -V' | tee >(bash) >/dev/null", "echo 'pip list' > >(bash)", "echo 'pip list' > >(sh -s)",
+                "cat <<E > >(bash)\npython3 z\nE", "echo x | tee >(python3 y)"])
+expect("pass", ["echo 'pip list' | tee >(grep x)", "echo 'pip list' | tee >(bash x.sh)", "echo 'pip list' | tee >(bash -c 'cat')",
+                "echo pip > >(cat)", "ls | tee >(wc -l)"])
+
+print("extglob and zsh glob groups: patterns, not subshells")
+expect("deny", [
+    # bash with extglob ends @( ... ) at a ")" in ${x:-, and runs the next line
+    "echo @(${x:-)\npython3 -V", "ls @(a|${x:-)b\npython3 -V", "!(${x:-)\npython3 -V", "echo !(${x:-)\npython3 -V",
+    "case x in @(${x:-)) echo;; esac\npython3 -V", "echo @(#); python3 -V",
+    # a "#" in a pattern is not a comment
+    "case x in @(#)) echo;; esac; python3 -V", "case x in @(a|#b)) echo;; esac; python3 -V",
+    # "!" and a subshell in bash without extglob and in dash
+    "!(python3 -V)",
+    "ls (src|tests)/*.py; python3 -V", "echo @($(python3 x))", "ls !(`pip list`)", "f () { python3 x; }",
+    "f() { python3 x; }", "if true; then f () { python3; }; fi", "function f () { python3 x; }",
+    # zsh: for NAME (WORDS) CMD, =(CMD), glob qualifiers that run code
+    "for i (1 2) python3 x", "diff =(python3 x) f", "echo *(e:'python3 -V':)", "ls *(+python3)", "ls *(.e['pip list'])",
+])
+expect("pass", ["ls !(*.py)", "rm -f (foo|bar).py", "ls (src|tests)/*.py", "ls (*.py|*.txt)", "echo !(python3 -V)",
+                "x=1 (python3 -V)", "ls !(test|python3)", "rm !(seed)", "ls *(.)", "ls *(om[1])", "ls @('$(pip)')",
+                "echo a () { python3; }", "ls -d !(python3|pip)"])
+
+print("a glob group with no \")\": the rest is read as commands, not taken into the word")
+expect("deny", ["echo @(a\npython3 -V", "ls !(x\npip list", "echo (a|b\npython3 -V", "echo @(a; python3 -V",
+                "ls *.py(x && pip list", "bash -c 'echo @(a\npython3 -V'", "echo 'echo @(a; pip list' | sh"])
+expect("pass", ["echo @(a\nls", "echo @(a; ls", "ls !(*.py) python3", "echo @(a|b) pip", "echo 'echo @(a; pip list'"])
+
+print("dash: [[ is a command, so a | next to a blank is a pipe")
+expect("deny", ["[[ x | python3 -V ]]", "[[ a =~ x |python3 ]]", "[[ a =~ x| python3 ]]", "[[ -n x ]] | python3 z"])
+expect("pass", ["[[ $x =~ ^(pip|uv)$ ]] && echo y", "[[ $x =~ (a | pip) ]] && echo y", "[[ $x =~ a|pip ]] && echo y",
+                "[[ -n x || $y =~ a|pip ]] && echo y", "[[ -n x || $y =~ (a|pip) ]] && echo y"])
+
+print("zsh: { ... } always { ... }")
+expect("deny", ["{ true } always { python3 -V }", "{ true; } always { python3 -V; }"])
+expect("pass", ["{ true; } always { echo pip; }"])
+
+print("escapes: $'...', printf and echo -e text into a shell")
+expect("deny", ["$'\\x70ython3' -V", "$'\\160ip' -V", "$'\\u0070ip' -V", "$'p\\x69p' list", "printf 'pyth\\157n3 -V' | sh",
+                "echo -e 'p\\x79thon3 -V' | bash", "echo -e 'p\\0171thon3 -V' | bash", "printf 'p\\ython3 -V' | sh",
+                "printf 'ls\\tx\\npip list' | sh"])
+expect("pass", ["echo $'\\x70ip'", "printf 'pyth\\157n3 -V'", "printf 'a\\tb\\n' | sh", "echo $'it\\'s' python",
+                "printf '\\x70ixi run python x' | sh"])
+
+print("Claude Code's shell is bash 3.2: $(...) is also read as it ends it (an apostrophe pair in a heredoc, a case pattern)")
+FAKE_SHELLS = {}
+for name, ver in (("bash32", "3.2.57(1)-release (arm64-apple-darwin25)"), ("bash52", "5.2.37(1)-release"),
+                  ("bash51", "5.1.16(1)-release"), ("bash53", "5.3.15(1)-release (aarch64-apple-darwin25.5.0)"),
+                  ("bash510", "5.10.0(1)-release"), ("bash60", "6.0.0(1)-release")):
+    d = TMP / name
+    d.mkdir()
+    (d / "bash").write_text(f'#!/bin/sh\necho "GNU bash, version {ver}"\n')
+    (d / "bash").chmod(0o755)
+    FAKE_SHELLS[name] = str(d / "bash")
+B32 = {"SHELL": FAKE_SHELLS["bash32"]}
+b32_deny = [
+    # Claude's usual commit heredoc: a ")" after an apostrophe pair ends the $( early, backticks after it run
+    "git commit -m \"$(cat <<'EOF'\nDon't use pip (it's slow): run `pip install -e .` instead\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\nDon't retry (it's idempotent now); `python -m app` handles it\nEOF\n)\"",
+    "gh pr create --title t --body \"$(cat <<'EOF'\nFixed it :) now \"pixi\" works `pip list`\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\n# Don't (it's) fine in a comment\nDon't (it's) `pip list`\nEOF\n)\"",
+    # unquoted $(...): the rest of the text is read as commands
+    "x=$(cat <<'EOF'\nDon't use pip (it's slow): run `pip install -e .` instead\nEOF\n)",
+    # a case pattern's ")" ends it too, and so does a ")" with no "(" in it
+    "git commit -m \"$(cat <<'EOF'\nUse case $x in pip) `python -V` ;; esac\nEOF\n)\"",
+    "gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\nSteps: 1) replace `pip install -e .` with pixi\nEOF\n)\"",
+]
+b32_pass = [
+    # the same $( end: no ")" outside the quotes bash 3.2 sees, or parens that pair up
+    "git commit -m \"$(cat <<'EOF'\nDon't use pip, it's slow\n- run `pip install -e .` instead\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\nUse pixi (not pip) for `pip install`\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\nIt's (mostly) done, they're fine: `pip list`\nEOF\n)\"",
+    # an odd apostrophe: a syntax error in bash 3.2, nothing runs
+    "git commit -m \"$(cat <<'EOF'\nDon't run `pip install` here\nEOF\n)\"",
+    # ends early, but nothing after it runs
+    "gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\nFixed it :) now \"pixi\" works\npytest passes\nEOF\n)\"",
+    # a comment hides the quotes and the ")" (when bash 3.2 runs it)
+    "git commit -m \"$(cat <<'EOF'\n# Don't (it's) `pip list`\nEOF\n)\"", "x=$(cat <<'EOF'\n# Don't (it's) `pip list`\nEOF\n)",
+    "echo $(case $x in a) echo 1;; esac)", "echo \"$(case $t in pip) echo 1;; esac)\" pip",
+    # $'...' has escapes there too (the ${x} makes the guard look at the bash 3.2 reading)
+    "echo $(printf $'it\\'s') pip", "echo \"$(printf $'it\\'s') pip\"", "echo $(printf $'it\\'s' ${x}) ';) ; pip list'",
+]
+expect("deny", b32_deny, "bash 3.2: ", **B32)
+expect("pass", b32_pass, "bash 3.2: ", **B32)
+for label, kw in (("zsh", {}), ("bash 5", {"SHELL": FAKE_SHELLS["bash52"]})):
+    expect("pass", b32_deny, f"{label}: ", **kw)
+check("bash 3.2: CLAUDE_CODE_SHELL counts over SHELL",
+      decision(b32_deny[0], SHELL=FAKE_SHELLS["bash52"], CLAUDE_CODE_SHELL=FAKE_SHELLS["bash32"]) == "deny")
+check("bash 3.2: a SHELL that is not bash is not asked its version", decision(b32_deny[0], SHELL=str(FAKE_PIXI)) == "pass")
+r = reason(b32_deny[0], **B32)
+check("bash 3.2: the reason explains it and offers git commit -F", "bash 3.2" in r and "git commit -F" in r, r)
+check("bash 3.2: no such note for other hits", "bash 3.2" not in reason("pip list", **B32))
+r = reason(b32_deny[1], **B32)
+check("bash 3.2: the note also comes with a tool looked up by name", "`python`" in r and "bash 3.2" in r, r)
+check("bash 3.2: PIXI_GUARD=ask still asks", decision("PIXI_GUARD=ask " + b32_deny[0], **B32) == "ask")
+check("bash 3.2: deep but checkable nesting is still scanned (bash 3.2 reads plain $(...) the same)",
+      hit("echo " + "$(echo " * 200 + "$(python x)" + ")" * 200, **B32) == "python")
+# The real shells agree (when here): with pip, python and pytest as functions that say RAN, and
+# git and gh doing nothing, macOS's /bin/bash 3.2 runs one in exactly the commands refused above.
+STUBS = "pip() { echo RAN >&2; }; python() { echo RAN >&2; }; pytest() { echo RAN >&2; }; git() { :; }; gh() { :; }\n"
+
+
+def bash_version(path):
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10).stdout
+    except OSError:
+        return (0, 0)
+    m = re.search(r"version (\d+)\.(\d+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def bash_major(path):
+    return bash_version(path)[0]
+
+
+def runs_tool(bash, cmd):
+    r = subprocess.run([bash, "-c", STUBS + cmd], capture_output=True, text=True, timeout=10, cwd=str(PLAIN),
+                       stdin=subprocess.DEVNULL)
+    return "RAN" in r.stderr
+
+
+real = {}
+for p in ("/bin/bash", shutil.which("bash"), "/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/opt/local/bin/bash"):
+    if p and os.path.exists(p):
+        real.setdefault(3 if bash_major(p) == 3 else 5 if bash_major(p) >= 4 else 0, p)
+if 3 in real:
+    for cmd in b32_deny:
+        check(f"real bash 3.2 runs the tool in {cmd!r}", runs_tool(real[3], cmd))
+    for cmd in b32_pass:
+        check(f"real bash 3.2 runs nothing in {cmd!r}", not runs_tool(real[3], cmd))
+if 5 in real:
+    for cmd in b32_deny + b32_pass:
+        check(f"real bash 5 runs nothing in {cmd!r}", not runs_tool(real[5], cmd))
+
+print("Claude Code's shell is bash 5.2 or later: a heredoc in $(...) also ends at a line that starts with its delimiter and has a \")\" after it")
+B52 = {"SHELL": FAKE_SHELLS["bash53"]}
+b52_deny = [
+    # the rest of the line after "EOF" is code, and its ")" ends the $(...): the backticks after it run
+    "git commit -m \"$(cat <<'EOF'\nFix EOFError on empty input\n\nEOFError was raised on empty stdin :)\n"
+    "Repro: `python -c 'input()' < /dev/null`\n\nCo-Authored-By: x <x@example.com>\nEOF\n)\"",
+    "gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\nEOFError is raised 1) run `pytest` to see it\nEOF\n)\"",
+    "git commit -m \"$(cat <<-'EOF'\n\tEOFError :) `pip list`\nEOF\n)\"",
+    # code on that line runs, and so do the lines after it while the $(...) is open
+    "git commit -m \"$(cat <<'EOF'\nEOF2 <<EOF `$(python -V)`\nmore\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\nEOF (fine)\n`python -V`\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\nEOF `python -V` :)\nEOF\n)\"", "git commit -m \"$(cat <<'EOF'\nEOFError: `pip list` :)\nmore\nEOF\n)\"",
+    "x=$(cat <<'EOF'\nEOF $(python -V) here\nEOF\n)",
+    # unquoted $(...): the lines after the ")" are commands
+    "x=$(cat <<'EOF'\nEOF handling fixed :)\npytest -q\nEOF\n)",
+]
+b52_pass = [
+    # ends early, but nothing after it runs
+    "git commit -m \"$(cat <<'EOF'\nEOF handling fixed :)\npytest passes\nEOF\n)\"",
+    # no line that starts with EOF and has a ")"
+    "git commit -m \"$(cat <<'EOF'\nHandle EOFError (empty stdin)\n\nTests: `pytest` passes\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\nEOFError on empty input\nRepro: `python -c 'input()'` (see #1)\nEOF\n)\"",
+    "x=$(cat <<'EOF'\nEOFx\npython -V )\nEOF\n)", "git commit -m \"$(cat <<'EOF'\n EOFError :) `pip list`\nEOF\n)\"",
+    "git commit -m \"$(cat <<'EOF'\n\tEOFError :) `pip list`\nEOF\n)\"",
+    # not in $(...): backticks and the top level read heredocs as usual
+    "x=`cat <<'EOF'\nEOFx :) ; python -V\nEOF\n`", "cat <<'EOF'\nEOFx :) `python -V`\nEOF",
+]
+expect("deny", b52_deny, "bash 5.2+: ", **B52)
+# <(...) and >(...) too (not run against the real shell below: its process substitution then never ends)
+expect("deny", ["echo hi > >(cat <<'EOF'\nEOFx :)\npython -V\nEOF\n)", "wc -l <(cat <<'EOF'\nEOFx :)\npython -V\nEOF\n)",
+                "wc -l <(cat <<'EOF'\nEOF `python -V` :)\nEOF\n)"],
+       "bash 5.2+: ", **B52)
+expect("pass", b52_pass, "bash 5.2+: ", **B52)
+for label, kw in (("zsh", {}), ("bash 5.1", {"SHELL": FAKE_SHELLS["bash51"]})):
+    expect("pass", b52_deny, f"{label}: ", **kw)
+for label in ("bash52", "bash510", "bash60"):
+    check(f"bash 5.2+: {label} reads it so too", decision(b52_deny[0], SHELL=FAKE_SHELLS[label]) == "deny")
+check("bash 5.2+: CLAUDE_CODE_SHELL counts over SHELL",
+      decision(b52_deny[0], SHELL=FAKE_SHELLS["bash51"], CLAUDE_CODE_SHELL=FAKE_SHELLS["bash53"]) == "deny")
+for cmd in (b52_deny[0], b52_deny[2]):  # a tool looked up by name, and pip
+    r = reason(cmd, **B52)
+    check(f"bash 5.2+: the reason explains it and offers git commit -F ({cmd[:40]!r})", "bash 5.2" in r and "git commit -F" in r, r)
+check("bash 5.2+: no such note for other hits", "bash 5.2" not in reason("pip list", **B52))
+check("bash 5.2+: PIXI_GUARD=ask still asks", decision("PIXI_GUARD=ask " + b52_deny[0], **B52) == "ask")
+# A tool from pixi global is not refused in that reading either.
+(TMP / "b52home" / ".pixi" / "bin").mkdir(parents=True)
+(TMP / "b52home" / ".pixi" / "bin" / "pytest").write_text("#!/x/python3\n")
+(TMP / "b52home" / ".pixi" / "bin" / "pytest").chmod(0o755)
+expect("pass", [b52_deny[1]], "bash 5.2+, pytest from pixi global: ", HOME=str(TMP / "b52home"),
+       PATH=f"{TMP / 'b52home' / '.pixi' / 'bin'}{os.pathsep}{BASE_PATH}", **B52)
+real52 = next((p for p in ("/bin/bash", shutil.which("bash"), "/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/opt/local/bin/bash")
+               if p and os.path.exists(p) and bash_version(p) >= (5, 2)), None)
+real51 = next((p for p in ("/bin/bash", shutil.which("bash"), "/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/opt/local/bin/bash")
+               if p and os.path.exists(p) and (4, 0) <= bash_version(p) < (5, 2)), None)
+if real52:
+    for cmd in b52_deny:
+        check(f"real bash 5.2+ runs the tool in {cmd!r}", runs_tool(real52, cmd))
+    for cmd in b52_pass:
+        check(f"real bash 5.2+ runs nothing in {cmd!r}", not runs_tool(real52, cmd))
+if real51:
+    for cmd in b52_deny + b52_pass:
+        check(f"real bash 5.1 runs nothing in {cmd!r}", not runs_tool(real51, cmd))
+
+print("checkpoint's job_start: read as /bin/sh reads it (it runs the job), not as Claude Code's shell")
+JSH32, JSH52 = {"PIXI_GUARD_JOB_SH": FAKE_SHELLS["bash32"]}, {"PIXI_GUARD_JOB_SH": FAKE_SHELLS["bash53"]}
+for cmd in b32_deny[:4]:
+    got = jdecision(command=cmd, **JSH32)
+    check(f"deny  job, /bin/sh bash 3.2, Claude Code's shell zsh: {cmd[:50]!r}", got == "deny", got)
+    got = jdecision(command=cmd, **JSH, **B32)
+    check(f"pass  job, /bin/sh not bash, Claude Code's shell bash 3.2: {cmd[:50]!r}", got == "pass", got)
+for cmd in b32_pass[:2]:
+    got = jdecision(command=cmd, **JSH32)
+    check(f"pass  job, /bin/sh bash 3.2: {cmd[:50]!r}", got == "pass", got)
+r = jreason(command=b32_deny[0], **JSH32)
+check("job, /bin/sh bash 3.2: the note says the job runs with /bin/sh", "checkpoint runs the job with /bin/sh, which here is bash 3.2" in r
+      and "Claude Code's shell" not in r, r)
+check("job argv, /bin/sh bash 3.2: sh -c code read so too",
+      jdecision(argv=["sh", "-c", b32_deny[0]], **JSH32) == "deny" and jdecision(argv=["sh", "-c", b32_deny[0]], **JSH) == "pass")
+for cmd in b52_deny[:3]:
+    got = jdecision(command=cmd, **JSH52)
+    check(f"deny  job, /bin/sh bash 5.2+, Claude Code's shell zsh: {cmd[:50]!r}", got == "deny", got)
+    got = jdecision(command=cmd, **JSH, **B52)
+    check(f"pass  job, /bin/sh not bash, Claude Code's shell bash 5.2+: {cmd[:50]!r}", got == "pass", got)
+r = jreason(command=b52_deny[0], **JSH52)
+check("job, /bin/sh bash 5.2+: the note says the job runs with /bin/sh", "checkpoint runs the job with /bin/sh, which here is bash 5.2" in r, r)
+check("job, /bin/sh bash 3.2: PIXI_GUARD=ask still asks", jdecision(command="PIXI_GUARD=ask " + b32_deny[0], **JSH32) == "ask")
+# The real /bin/sh (no override): bash 3.2 on macOS, dash on Debian.
+sh_ver = bash_version("/bin/sh")
+if sh_ver[0] == 3 or sh_ver == (0, 0):
+    want = "deny" if sh_ver[0] == 3 else "pass"
+    got = jdecision(command=b32_deny[0], PIXI_GUARD_JOB_SH=None)
+    check(f"job, the real /bin/sh ({'bash 3' if want == 'deny' else 'not bash'}): {want}", got == want, got)
+    if want == "deny" and 3 in real:
+        check("the real /bin/sh runs the tool in that job", runs_tool("/bin/sh", b32_deny[0]))
+
+print("commands that run their arguments: parallel, hyperfine, numactl, entr, watchexec, nodemon, unbuffer, MCP inspector")
+expect("deny", [
+    "parallel python run.py ::: 1 2 3", "parallel -j4 'pip install {}' ::: a b", "parallel --jobs 4 python {} ::: a.py",
+    "parallel -j 4 --bar python {} ::: a.py", "ls *.py | parallel python", "parallel ::: 'python a.py' ls",
+    "parallel :::+ ls 'pip list'", "echo 'pip list' | parallel", "parallel {} ::: 'pip list'", "parallel 'cd x && {}' ::: 'pytest -q'",
+    "parallel -q python -c 'print(1)' ::: a", "sem -j 2 python x.py", "parallel -j3 -- 'pip list' ls", "parallel python -- a b",
+    "hyperfine 'python a.py'", "hyperfine -w 3 'ls' 'pip list'", "hyperfine --setup 'pip install x' 'ls'",
+    "hyperfine -P n 1 3 'python a.py {n}'", "hyperfine -L v a,b ls --prepare='pip list'", "hyperfine --shell python3 'print(1)'",
+    "hyperfine --shell=python3 'print(1)'", "hyperfine -Spython3 'print(1)'",
+    "hyperfine -N -- 'python x.py'", "hyperfine -s'pip list' ls",
+    "numactl --cpunodebind=0 python x", "numactl -N 0 -m 0 python x", "numactl --interleave all python x", "numactl -C0-3 pytest",
+    "nodemon --exec python app.py", "nodemon -x 'python app.py'", "nodemon --exec='pip list'", "nodemon app.py", "nodemon -w src app.py",
+    "watchexec -e py pytest", "watchexec -e py -- python app.py", "watchexec -r 'pip install -e . && pytest'",
+    "watchexec -w src -c -- pytest", "ls *.py | entr pytest", "ls | entr -c python x", "ls | entr -s 'pytest -q'",
+    "unbuffer python x", "unbuffer -p python x", "npx @modelcontextprotocol/inspector python server.py",
+    "npx -y @modelcontextprotocol/inspector -e K=V -- python server.py", "npx @modelcontextprotocol/inspector@0.16 uv run server.py",
+    "bunx @modelcontextprotocol/inspector --config c.json --server s python s.py", "npx -c 'pip list'",
+])
+expect("pass", [
+    "parallel echo ::: 'pip list'", "parallel -q echo 'a; pip list' ::: x", "parallel -j4 gzip ::: *.log", "ls | parallel -X rm", "parallel --tag echo {} :::: pip.txt",
+    "parallel pixi run python {} ::: a.py", "hyperfine 'ls' 'pixi run python a.py'", "hyperfine --export-json out.json make",
+    "hyperfine -n pip ls", "hyperfine -P n 1 3 'sleep {n}'", "numactl --hardware", "numactl -N 0 make", "nodemon server.js",
+    "nodemon --exec 'pixi run python app.py'", "nodemon -w app.py server.js", "watchexec -e py -- pixi run pytest",
+    "watchexec -e py make", "ls | entr make", "ls | entr -s 'make test'", "unbuffer make", "npx prettier --write .",
+    "npx @modelcontextprotocol/inspector pixi run python server.py", "npx @modelcontextprotocol/inspector node build/index.js",
+    "npx -y create-react-app python-app",
+])
+
+print("Python console scripts by name")
+expect("deny", ["coverage run -m pytest", "coverage3 report", "coverage-3.12 html", "pip-audit", "pip-licenses", "pip-3.12 list",
+                "pip-compile", "uvicorn app:app", "flask run", "gunicorn app:app", "streamlit run a.py", "alembic upgrade head",
+                "django-admin startproject x", "celery -A x worker", "torchrun --nproc_per_node 2 t.py", "accelerate launch t.py",
+                "deepspeed t.py", "sphinx-build docs out", "mkdocs serve", "jupytext --to py nb.ipynb"])
+# pre-commit and nbstripout: usually global git-hook tools (pixi global install pre-commit is common)
+expect("pass", ["pre-commit run --all-files", "nbstripout x.ipynb", "pipe-viewer", "echo coverage pip-audit", "flaskr", "mkdocs-x",
+                # shell scripts named pip-*: not pip's tools
+                "bin/pip-check-deps.sh", "./scripts/pip-audit-report.sh", "bash scripts/pip-sync.sh", "pip-check-deps.sh"])
+expect("deny", ["pip-sync requirements.txt", "pip-3 list", "bin/pip-audit", "pip-audit.py"])
+
+print("an active virtual or conda env: a bare name that is a Python script in it")
+venv = TMP / "venv"
+(venv / "bin").mkdir(parents=True)
+for name, text in (("mytool", f"#!{venv}/bin/python\nimport sys\n"),
+                   ("longtool", "#!/bin/sh\n'''exec' \"/very/long/path/bin/python3\" \"$0\" \"$@\"\n' '''\nimport x\n"),
+                   ("envpy", "#!/usr/bin/env python3\n"), ("shtool", "#!/bin/sh\necho hi\n"),
+                   ("ruff", "\x7fELF\x02\x01\x01\n\x00\x00binary"), ("activate", "# This file must be used with source\n")):
+    (venv / "bin" / name).write_text(text)
+    (venv / "bin" / name).chmod(0o755)
+VENV = {"VIRTUAL_ENV": str(venv)}
+expect("deny", ["mytool serve", "sudo mytool", "ls | xargs mytool", "longtool x", "envpy", "sh -c 'cd /tmp && mytool'",
+                "{mytool,x} y", "${T:-mytool} run", "ls; mytool"], "venv: ", **VENV)
+expect("pass", ["ruff check .", "shtool", "ls", "./mytool", "echo mytool", "activate", "mytoolx", "pixi run mytool"], "venv: ", **VENV)
+r = reason("mytool serve", **VENV)
+check("venv: the reason names the env", f"is a Python script in {venv}/bin" in r, r)
+check("no active env: mytool passes", decision("mytool serve") == "pass")
+check("venv: PIXI_GUARD=ask asks", decision("PIXI_GUARD=ask mytool", **VENV) == "ask")
+conda = TMP / "miniforge3"
+(conda / "bin").mkdir(parents=True)
+(conda / "bin" / "condatool").write_text(f"#!{conda}/bin/python3.12\n")
+(conda / "bin" / "curl").write_text("\xcf\xfa\xed\xfe binary")
+pixienv = TMP / "pixiproj2" / ".pixi" / "envs" / "default"
+(pixienv / "bin").mkdir(parents=True)
+(pixienv / "bin" / "condatool").write_text(f"#!{pixienv}/bin/python3.12\n")
+expect("deny", ["condatool x"], "conda env: ", CONDA_PREFIX=str(conda))
+expect("pass", ["curl -fsSL x", "mytool"], "conda env: ", CONDA_PREFIX=str(conda))
+expect("pass", ["condatool x"], "pixi env (pixi shell): ", CONDA_PREFIX=str(pixienv))
+# a detached pixi env (pixi's detached-environments) lives outside .pixi/envs; conda-meta/pixi marks it
+detached = TMP / "pixicache" / "envs" / "proj-1234" / "envs" / "default"
+(detached / "bin").mkdir(parents=True)
+(detached / "conda-meta").mkdir()
+(detached / "conda-meta" / "pixi").write_text("{}\n")
+(detached / "bin" / "condatool").write_text(f"#!{detached}/bin/python3.12\n")
+expect("pass", ["condatool x"], "detached pixi env (pixi shell): ", CONDA_PREFIX=str(detached))
+expect("pass", ["mytool x"], "VIRTUAL_ENV without a bin folder: ", VIRTUAL_ENV=str(TMP / "no-such-venv"))
+
+print("tools from pixi global and pixi environments: let through where they resolve (installers still refused)")
+
+
+def console_scripts(d, names, py):
+    d.mkdir(parents=True, exist_ok=True)
+    for n in names:
+        (d / n).write_text(f"#!{py}\nimport sys\n")
+        (d / n).chmod(0o755)
+
+
+gh = TMP / "pghome"  # a HOME with pixi global tools in ~/.pixi/bin
+gbin = gh / ".pixi" / "bin"
+console_scripts(gbin, ["mkdocs", "black", "ipython", "jupyter", "pytest", "coverage", "jupytext", "uv", "python3", "pip",
+                       "conda"] + [f"t{k}" for k in range(1, 18)], gh / ".pixi" / "envs" / "x" / "bin" / "python3")
+console_scripts(gh / ".pixi" / "envs" / "black" / "bin", ["black"], gh / ".pixi" / "envs" / "black" / "bin" / "python3")
+other = TMP / "otherbin"  # pip install --user / brew copies of the same tools
+console_scripts(other, ["mkdocs", "pytest"], "/usr/bin/python3")
+pxproj = TMP / "pxproj"  # a pixi workspace with its default env
+pxenv = pxproj / ".pixi" / "envs" / "default"
+console_scripts(pxenv / "bin", ["pytest", "python", "mkdocs", "pip"], pxenv / "bin" / "python")
+(pxenv / "conda-meta").mkdir()
+(pxenv / "conda-meta" / "pixi").write_text("{}\n")
+(pxproj / "pixi.toml").write_text("[workspace]\n")
+phome = TMP / "pxhome2"  # a custom PIXI_HOME (pixi's default on some setups: ~/.local/share/pixi)
+console_scripts(phome / "bin", ["mkdocs", "black"], phome / "envs" / "mkdocs" / "bin" / "python3")
+console_scripts(phome / "envs" / "mkdocs" / "bin", ["mkdocs"], phome / "envs" / "mkdocs" / "bin" / "python3")
+detached = TMP / "cache" / "envs" / "proj-1a2b"  # detached-environments: a pixi env outside the workspace
+console_scripts(detached / "bin", ["pytest"], detached / "bin" / "python")
+(detached / "conda-meta").mkdir()
+(detached / "conda-meta" / "pixi").write_text("{}\n")
+notpixi = TMP / "cache2" / "envs" / "proj"  # the same, without pixi's conda-meta/pixi: some other env
+console_scripts(notpixi / "bin", ["pytest"], notpixi / "bin" / "python")
+G = {"HOME": str(gh), "PATH": f"{gbin}{os.pathsep}{BASE_PATH}"}
+expect("pass", ["mkdocs build", "mkdocs serve", "black --check .", "ipython -c 'print(1)'", "jupyter lab", "pytest -q",
+                "coverage report", "jupytext --to py nb.ipynb", "python3 -V", "mkdocs build && black --check .",
+                "\"pytest\" -q", "${T:-pytest} -q", "~/.pixi/bin/mkdocs build", f"{gbin}/black --check .",
+                "$HOME/.pixi/bin/black .", "\"$HOME/.pixi/bin/black\" .", "${HOME}/.pixi/bin/mkdocs build",
+                "~/.pixi/envs/black/bin/black .", "PIXI_GUARD=ask mkdocs build", "nice -n 5 black .", "env FOO=1 black .",
+                "git commit -m \"$(cat <<'EOF'\nfix\nEOF\n)\" && pytest -q"], "pixi global: ", **G)
+expect("pass", [" && ".join(f"t{k}" for k in range(1, 17))], "pixi global, 16 names: ", PIXI_GUARD_TOOLS="t[0-9]+", **G)
+expect("deny", [
+    # installers and env managers: pixi add / pixi install instead, even from pixi global
+    "uv --version", "pip install x", "conda list", "~/.pixi/bin/uv sync", f"{gbin}/pip list", "$HOME/.pixi/bin/pip list",
+    # not in pixi global (nowhere, or elsewhere first on PATH)
+    "python -V", "pytest -q && flask run", "/usr/local/bin/mkdocs build", "~/.pixi/bin/sub/mkdocs", "~/.pixi/mkdocs",
+    "~/.pixi/bin/../../x/pytest", "$HOMEX/.pixi/bin/black .", "${X}pytest -q", "{pytest,x} -q",
+    # PATH set in the command: where the name resolves is not known here
+    "PATH=/usr/local/bin:$PATH mkdocs build", "export PATH=/opt/x:$PATH; pytest -q", "env PATH=/usr/local/bin pytest",
+    "mkdocs build; PATH+=:/x", "sh -c 'PATH=/x pytest'", "typeset -x PATH=/x; pytest",
+    # sudo, su and env -i run it with another PATH
+    "sudo -u bob black .", "sudo mkdocs build", "doas pytest", "env -i pytest", "env - pytest", "env -u PATH pytest",
+    "env --unset=PATH pytest", "su -c 'pytest' bob", "runuser -u bob -- pytest"], "pixi global: ", **G)
+expect("deny", [" && ".join(f"t{k}" for k in range(1, 18))], "pixi global, more than 16 names: ",
+       PIXI_GUARD_TOOLS="t[0-9]+", **G)
+expect("pass", ["PYTHONPATH=src pytest -q", "MANPATH=x mkdocs build", "git commit -m 'set PATH=x' && black ."],
+       "pixi global, not a PATH assignment: ", **G)
+expect("deny", ["mkdocs build", "pytest -q"], "a non-pixi copy first on PATH: ",
+       HOME=str(gh), PATH=os.pathsep.join([str(other), str(gbin), BASE_PATH]))
+expect("pass", ["mkdocs build", "pytest -q"], "pixi global first on PATH: ",
+       HOME=str(gh), PATH=os.pathsep.join([str(gbin), str(other), BASE_PATH]))
+# Claude Code started with a short PATH (the desktop app): its Bash may still find ~/.pixi/bin
+expect("pass", ["mkdocs build", "black ."], "pixi global, not on the hook's PATH: ", HOME=str(gh))
+expect("deny", ["flask run", "pip list"], "pixi global, not on the hook's PATH: ", HOME=str(gh))
+PH = {"PIXI_HOME": str(phome)}
+expect("pass", ["mkdocs build", "$PIXI_HOME/bin/mkdocs build", "\"$PIXI_HOME/bin/black\" .", "${PIXI_HOME}/bin/mkdocs build",
+                f"{phome}/bin/mkdocs build", f"{phome}/envs/mkdocs/bin/mkdocs build", "${PIXI_HOME:-$HOME/.pixi}/bin/mkdocs build"],
+       "$PIXI_HOME: ", **PH)
+expect("deny", ["pytest -q", f"{phome}/lib/mkdocs", f"{phome}/bin/pip list"], "$PIXI_HOME: ", **PH)
+# (with no PIXI_HOME, $PIXI_HOME/bin/mkdocs is /bin/mkdocs)
+expect("deny", ["$PIXI_HOME/bin/mkdocs build", "${PIXI_HOME}/bin/black ."], "PIXI_HOME not set: ")
+PX = {"cwd": pxproj}
+expect("pass", [".pixi/envs/default/bin/pytest -q", ".pixi/envs/default/bin/python -c 'print(1)'", ".pixi/envs/venv/bin/httpx x",
+                "./.pixi/envs/default/bin/mkdocs build", f"{pxenv}/bin/pytest -q", "cd /tmp && " + f"{pxenv}/bin/pytest -q"],
+       "a pixi env by its path: ", **PX)
+expect("pass", ["\"$PWD/.pixi/envs/default/bin/pytest\" -q", "$(pwd)/.pixi/envs/default/bin/python -V",
+                "${PROJ:-.}/.pixi/envs/default/bin/mkdocs build", "cd sub && \"$OLDPWD\"/.pixi/envs/default/bin/pytest"],
+       "a pixi env by a path with an expansion before .pixi: ", **PX)
+expect("deny", ["\"$PWD/.pixi/envs/../bin/pytest\"", "$PWD/.pixi/envs/$E/bin/pytest", "$PWD/.venv/bin/pytest",
+                "$PWD/.pixi/envs/default/bin/pip install x", "$PWD.pixi/envs/default/bin/pytest"],
+       "a pixi env by a path with an expansion before .pixi: ", **PX)
+expect("deny", [".pixi/envs/default/bin/pip install x", ".pixi/envs/default/bin/uv sync", ".pixi/env/default/bin/pytest",
+                ".pixi/envs/../bin/pytest", ".pixi/envs/default/lib/pytest", ".venv/bin/pytest", "pytest -q", "envs/venv/bin/httpx x"],
+       "a pixi env by its path: ", **PX)
+# Claude Code started inside `pixi shell`
+PS = {"cwd": pxproj, "CONDA_PREFIX": str(pxenv), "PIXI_IN_SHELL": "1", "PATH": f"{pxenv / 'bin'}{os.pathsep}{BASE_PATH}"}
+expect("pass", ["pytest -q", "python -V", "mkdocs build", "python -m pytest && mkdocs build"], "pixi shell: ", **PS)
+expect("deny", ["pip install x", "flask run", "python3 -V"], "pixi shell: ", **PS)
+expect("pass", ["pytest -q"], "a detached pixi env (conda-meta/pixi): ", PATH=f"{detached / 'bin'}{os.pathsep}{BASE_PATH}")
+# each kind of pixi bin folder, as the name resolves on PATH
+expect("pass", ["black ."], "pixi global's env bin on PATH: ",
+       PATH=f"{gh / '.pixi' / 'envs' / 'black' / 'bin'}{os.pathsep}{BASE_PATH}")
+expect("pass", ["mkdocs build"], "$PIXI_HOME/bin on PATH: ", PIXI_HOME=str(phome), PATH=f"{phome / 'bin'}{os.pathsep}{BASE_PATH}")
+expect("pass", ["mkdocs build"], "$PIXI_HOME/envs/NAME/bin on PATH: ",
+       PIXI_HOME=str(phome), PATH=f"{phome / 'envs' / 'mkdocs' / 'bin'}{os.pathsep}{BASE_PATH}")
+expect("deny", ["mkdocs build"], "a PIXI_HOME-like folder that is not $PIXI_HOME: ",
+       PATH=f"{phome / 'envs' / 'mkdocs' / 'bin'}{os.pathsep}{BASE_PATH}")
+# ${PIXI_HOME:-WORD}: with no PIXI_HOME, WORD is what runs
+expect("pass", ["${PIXI_HOME:-$HOME/.pixi}/bin/mkdocs build"], "PIXI_HOME not set: ", HOME=str(gh))
+expect("deny", ["${PIXI_HOME:-/usr}/bin/pytest -q"], "PIXI_HOME not set: ", HOME=str(gh))
+expect("deny", ["pytest -q"], "an env without conda-meta/pixi: ", PATH=f"{notpixi / 'bin'}{os.pathsep}{BASE_PATH}")
+r = reason("PATH=/x:$PATH mkdocs build", **G)
+check("pixi global: the reason says PATH is set and offers the path", "PATH of its own" in r and "~/.pixi/bin/mkdocs" in r, r)
+check("pixi global: PIXI_GUARD=ask still asks for one elsewhere",
+      decision("PIXI_GUARD=ask mkdocs build", HOME=str(gh), PATH=os.pathsep.join([str(other), BASE_PATH])) == "ask")
+check("a non-pixi copy first on PATH: the refusal names it",
+      hit("mkdocs build", HOME=str(gh), PATH=os.pathsep.join([str(other), str(gbin), BASE_PATH])) == "mkdocs")
+
+print("a *.py script run by its path: let through if its #! line runs pixi")
+sb = TMP / "shebang"
+(sb / "tools").mkdir(parents=True)
+for name, first in (("report.py", "#!/usr/bin/env -S pixi exec --spec rich -- python"),
+                    ("direct.py", "#!/opt/homebrew/bin/pixi run python"), ("envvar.py", "#!/usr/bin/env -S X=1 pixi exec python"),
+                    ("plain.py", "#!/usr/bin/env python3"), ("nobang.py", "import sys"), ("pixiname.py", "#!/usr/bin/env pixi-python")):
+    (sb / "tools" / name).write_text(first + "\nprint(1)\n")
+    (sb / "tools" / name).chmod(0o755)
+(sb / "tools" / "dir.py").mkdir()
+# a file named like a glob: bash runs what the glob matches (odd1.py), not the file of that name
+(sb / "tools" / "odd[1].py").write_text("#!/usr/bin/env -S pixi exec python\n")
+(sb / "tools" / "odd1.py").write_text("#!/usr/bin/env python3\n")
+SB = {"cwd": sb}
+expect("pass", ["./tools/report.py", "tools/report.py --flag", "./tools/direct.py", "./tools/envvar.py", "sudo ./tools/report.py",
+                f"{sb}/tools/report.py", "~/shebang/tools/report.py", "./tools/report.py && ls", "\"./tools/report.py\" x",
+                "find . -name x -exec ./tools/report.py {} \\;", "ls | xargs ./tools/report.py", "nice ./tools/report.py",
+                "./tools/report.py; ./tools/direct.py", " ".join(["./" * k + "tools/report.py;" for k in range(1, 17)])],
+       "pixi #!: ", **SB)
+expect("deny", ["./tools/plain.py", "./tools/nobang.py", "./tools/missing.py", "./tools/pixiname.py", "./tools/dir.py",
+                "./tools/report.py && python x", "./tools/report.py; ./tools/plain.py", "cd tools && ./report.py",
+                # (./tools/report.py is let through from this cwd: after a cd it may be another file)
+                "cd /tmp; ./tools/report.py", "(cd sub && ./tools/report.py)", "env -C /tmp ./tools/report.py",
+                "env --chdir=/tmp ./tools/report.py", "sudo -D /tmp ./tools/report.py", "pushd /tmp; ./tools/report.py",
+                "git rebase -x ./tools/report.py main", "report.py",
+                "$D/tools/report.py", "${D}./tools/report.py", "./tools/rep*.py", "./tools/odd[1].py", "./tools/{report,x}.py",
+                "find . -execdir ./tools/report.py \\;",
+                " ".join(["./" * k + "tools/report.py;" for k in range(1, 18)])],
+       "pixi #!: ", **SB)
+expect("pass", [f"cd /tmp && {sb}/tools/report.py"], "pixi #!: absolute path after cd: ", **SB)
+expect("deny", ["./tools/report.py"], "pixi #!, another cwd: ")
+r = reason("./tools/plain.py", **SB)
+check("pixi #!: the reason shows the #! line that is let through", "plain.py" in r and "#!/usr/bin/env -S pixi exec" in r, r)
+r = reason("cd tools && ./report.py", **SB)
+check("pixi #!: after cd, the reason says a relative path is not looked up", "after `cd`" in r and "absolute path" in r, r)
+
+print("a *.py script the same command writes: refused (its #! line is read before the command runs)")
+PIXI_BANG = "#!/usr/bin/env -S pixi exec --spec rich -- python"
+written = [
+    f"cat > tools/new.py <<'EOF'\n{PIXI_BANG}\nprint(1)\nEOF\nchmod +x tools/new.py && ./tools/new.py",
+    # (the reverse: a pixi #! script overwritten with a python3 one)
+    "cat > tools/report.py <<'EOF'\n#!/usr/bin/env python3\nprint(1)\nEOF\n./tools/report.py",
+    f"sed -i '' '1s|.*|{PIXI_BANG}|' tools/plain.py && ./tools/plain.py",
+    "sed -i.bak 1d tools/report.py; ./tools/report.py", "sed --in-place -e 1d tools/report.py; tools/report.py",
+    "perl -pi -e 's/a/b/' tools/report.py && ./tools/report.py", "cp tools/plain.py tools/report.py && ./tools/report.py",
+    "mv tools/plain.py tools/report.py && ./tools/report.py", "cp /tmp/report.py tools/ && ./tools/report.py",
+    "cp -t tools /tmp/report.py && ./tools/report.py", "install -m 755 /tmp/r.py tools/report.py && ./tools/report.py",
+    "ln -sf plain.py tools/report.py && ./tools/report.py",
+    "printf '#!/usr/bin/env python3\\n' > tools/report.py; ./tools/report.py", "echo x >> tools/report.py && ./tools/report.py",
+    "tee tools/report.py < /dev/null && ./tools/report.py", "{ echo '#!/usr/bin/env python3'; } > tools/report.py; ./tools/report.py",
+    "curl -fsSL https://example.com/r.py -o tools/report.py && ./tools/report.py",
+    "curl -fsSLo tools/report.py https://example.com/r.py && ./tools/report.py",
+    "wget -qO tools/report.py https://example.com/r.py && ./tools/report.py",
+    "cat > \"$PWD/tools/report.py\" <<'EOF'\nx\nEOF\n./tools/report.py",
+    f"cat > {sb}/tools/report.py <<'EOF'\nx\nEOF\n./tools/report.py", f"echo >> tools/report.py; {sb}/tools/report.py",
+    "cat > ./tools/./report.py <<'EOF'\nx\nEOF\ntools/report.py", "cat > \"$F\".py <<'EOF'\nx\nEOF\n./tools/report.py",
+    "./tools/report.py && cat > tools/report.py < /dev/null",
+]
+expect("deny", written, "pixi #!, written: ", **SB)
+expect("pass", [
+    "chmod +x tools/report.py && ./tools/report.py", "cat tools/report.py && ./tools/report.py", "./tools/report.py > out.txt",
+    "./tools/report.py > tools/out.json", "cat > tools/other.py <<'EOF'\nx\nEOF\n./tools/report.py",
+    "cp tools/report.py /tmp/backup.py && ./tools/report.py", "cp tools/report.py backup/ && ./tools/direct.py",
+    "sed -n 1p tools/report.py && ./tools/report.py", "tee log.txt < /dev/null && ./tools/report.py",
+    "git add tools/report.py && ./tools/report.py", "curl -o data.json https://example.com && ./tools/report.py",
+    "./tools/report.py 2>&1 | tee report.log", "cp -i a.txt b.txt && ./tools/report.py", "echo x > /tmp/report.py.txt; ./tools/report.py",
+], "pixi #!, not written: ", **SB)
+r = reason(written[0], **SB)
+check("pixi #!, written: the reason says why and to write the file first, without inviting the same command again",
+      "This same command writes `new.py`" in r and "Write the file first" in r and "may be run by its path" not in r, r)
+
+print("work budgets (a command too big or nested to check is refused, never a timeout)")
+complex_cmds = {
+    "2000 sh -c strings then one more": "sh -c 'true'; " * 2000 + "sh -c 'python x'",
+    "eval chain": "eval " * 3000 + "python x",
+    "env -S chain": "env -S nice " * 2000 + "python x",
+    "deep \"$( nesting": "echo " + "\"$( echo " * 20000 + "python x" + " )\"" * 20000,
+    "deep find -exec nesting": "find . -exec " * 20000 + "ls",
+    "unterminated \"$( x50000": "echo " + "\"$( " * 50000 + "\npython x",
+}
+for label, cmd in complex_cmds.items():
+    (out, err), cpu, _ = budgeted(pre, cmd)
+    d = out and out["hookSpecificOutput"]
+    check(f"{label} ({len(cmd) // 1000}KB): refused in {cpu:.2f}s CPU", d and d["permissionDecision"] == "deny" and cpu < CPU, (d, err))
+check("2000 sh -c strings then python: python found", decision("sh -c 'true'; " * 2000 + "sh -c 'python x'") == "deny")
+r = reason("eval " * 3000 + "ls")
+check("too-complex reason says so and offers the override", "too large" in r and "PIXI_GUARD=ask" in r, r)
+out, _ = pre("PIXI_GUARD=ask " + "eval " * 3000 + "ls")
+d = (out or {}).get("hookSpecificOutput", {})
+check("PIXI_GUARD=ask on a too-complex command asks, saying why",
+      d.get("permissionDecision") == "ask" and "too large" in d.get("permissionDecisionReason", ""), d)
+check("deep but checkable nesting is still scanned", hit("echo " + "$(echo " * 200 + "$(python x)" + ")" * 200) == "python")
+# Over 256KB: refused unread. Below it, parsing has a budget too: views, nested
+# shell strings, re-reads after array errors and brace expansion all count.
+views = "{x; echo $[a b]; : $(: ${x:-(}); "
+budget_cmds = {
+    "over 256KB, unread": "echo " + "a" * 270000,
+    "bash -c string read in every view": "bash -c '" + views + "{ echo }; " * 25000 + "'",
+    "echo of 1-character words into sh": "echo " + "a " * 125000 + "| sh",
+    "bash <(echo of 1-character words)": "bash <(echo " + "a " * 125000 + ")",
+    "array errors on every line": "bash -c '" + "a=(;)\n" * 10000 + "'",
+    "brace expansion in every command": "{a,b}{c,d}{e,f}{g,h} x; " * 9000,
+}
+for label, cmd in budget_cmds.items():
+    r, cpu, _ = budgeted(reason, cmd)
+    check(f"{label} ({len(cmd) // 1000}KB): too complex, {cpu:.2f}s CPU", "too large" in r and cpu < CPU, r)
+out, _ = pre("PIXI_GUARD=ask echo " + "a" * 270000)
+check("PIXI_GUARD=ask on a command over 256KB asks", (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") == "ask", out)
+check("a 250KB command is still read", decision("echo " + "a" * 250000 + "; ls") == "pass"
+      and decision("echo " + "a" * 250000 + "; pip list") == "deny")
+
+print("look-aheads stop as soon as a budget is spent (nested ${...$(...)} read in two views took exponential time)")
+for label, cmd in (
+    ("nested ${x:-{$(: x30", "echo " + "${x:-{$(: " * 30 + ")}" * 30 + "; ls"),
+    ("nested \"${x:-'$(: x30", 'echo "' + "${x:-'$(: \"" * 30 + "x)'}\"" * 30 + "; ls"),
+    ("nested ${x:-{$(: x3000", "echo " + "${x:-{$(: " * 3000 + ")}" * 3000 + "; ls"),
+    ("nested $(( x30000", "echo $(( " + "$(( " * 30000 + "1" + " ))" * 30001),
+    ("nested \"$(( x30000", 'echo "$(( ' + "$(( " * 30000 + "1" + " ))" * 30001 + '"'),
+    ("unclosed $(( repeated", "echo $(( ;" * 24000 + "\nls"),
+    ("unclosed $(( repeated in $(...)", ": $(echo " + "$(( ;" * 30000 + ")\nls"),
+    ("(( repeated in $(...), one ) at its end", "echo $(echo " + "((" * 60000 + ")\nls"),
+):
+    # (and well before the 7 s watchdog, which would say "too large" too)
+    r, cpu, wall = budgeted(reason, cmd, wall=6)
+    check(f"{label} ({len(cmd) // 1000}KB): too complex, {cpu:.2f}s CPU, {wall:.2f}s", "too large" in r and cpu < CPU and wall < 6, r[:80])
+
+
+print("raw control characters stay linear (each \\x01 was a new record, re-copying the text)")
+for label, cmd, want in (
+    ("300K \\u0001 then python3", "\x01" * 300000 + "\npython3 x", "too large"),
+    ("240K \\u0001 then python3", "\x01" * 240000 + "\npython3 x", "`python3`"),
+    ("1MB of \\u0001\\u0002", "\x01\x02" * 500000 + "\npython3 x", "too large"),
+):
+    r, cpu, _ = budgeted(reason, cmd)
+    check(f"{label} ({len(cmd) // 1000}KB): refused, {cpu:.2f}s CPU", want in r and cpu < CPU, r[:80])
+raw = '{"session_id":"s1","cwd":"%s","tool_input":{"command":"%s\\npython3 x"}}' % (PLAIN, "\x01" * 300000)
+(out, _), cpu, _ = budgeted(run, "pre", None, raw=raw)
+check(f"300K raw \\x01 bytes in the JSON: refused, {cpu:.2f}s CPU",
+      (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") == "deny" and cpu < CPU, out)
+out, _ = pre("echo " + "\x01" * 200000 + "a" * 70000 + "; PIXI_GUARD=ask python3 x")
+check("over 256KB: PIXI_GUARD=ask after a \\x01 record still asks",
+      (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") == "ask", out)
+# Over 1.6MB of JSON string only that much is decoded (more than 256KB, so "too large"): an
+# ask at the start still asks; one past that point is cut off, and the command is refused.
+for cmd, want in (("PIXI_GUARD=ask echo " + "\x01" * 300000 + "; python3 x", "ask"),
+                  ("echo " + "\x01" * 300000 + "; PIXI_GUARD=ask python3 x", "deny")):
+    (out, _), cpu, _ = budgeted(pre, cmd)
+    check(f"1.8MB of JSON, PIXI_GUARD=ask {'first' if want == 'ask' else 'last'}: {want}, {cpu:.2f}s CPU",
+          (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") == want and cpu < CPU, out)
+out, _ = pre("echo " + "a" * 300000 + "\x01PIXI_GUARD=ask python3 x")
+check("over 256KB: \\x01 right before PIXI_GUARD=ask is not a separator (refused)",
+      (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out)
+
+print("a program word full of unclosed ${ stays linear (a regex gsub retried each ${ to the end)")
+for label, cmd in (
+    ("${ x120000", "${" * 120000),
+    ("backtick then ${ x120000", "`" + "${" * 120000),
+    ("58 backtick bodies of ${ x2048", ("`" + "${" * 2048 + "`") * 58),
+    ("${ x120000 then python3", "${" * 120000 + "}; python3 x"),
+):
+    d, cpu, _ = budgeted(decision, cmd)
+    check(f"{label} ({len(cmd) // 1000}KB): {d}, {cpu:.2f}s CPU", d in ("pass", "deny") and cpu < CPU, d)
+
+print("long option words stay linear (substr() per character walked the whole word)")
+n = 250000
+_, base, _ = timed(decision, "echo " + "i" * n + "; python3 -V")
+for cmd in ("env -" + "i" * n + " python3 -V", "sudo -" + "E" * n + " python3 -V", "bash -" + "e" * n + " -c 'python3 -V'",
+            "su -" + "m" * n + " -c 'python3 -V'", "xargs -" + "t" * n + " python3 -V",
+            "tmux new -" + "d" * n + " 'python3 -V'"):
+    d, cpu, _ = budgeted(decision, cmd, cpu=2 * base + 0.3)
+    check(f"{cmd[:8]}... ({len(cmd) // 1000}KB): {d}, {cpu:.2f}s CPU (echo of the same size: {base:.2f}s)",
+          d == "deny" and cpu < 2 * base + 0.3, d)
+
+print("watchdog: a scan still running after PIXI_GUARD_WATCHDOG seconds is refused (a hook timeout lets it through)")
+REAL_AWK = shutil.which("awk")
+FAKE_AWKS = {}
+for name, scan_does in (
+        # the scan (awk -v tools=...) spins, for 30 s at most; other awk calls run as usual
+        ("slow", "exec '%s' 'BEGIN { srand(); t = srand(); for (;;) { srand(); if (srand() - t > 30) exit } }'" % REAL_AWK),
+        ("failing", "exit 2")):
+    d = TMP / f"{name}-awk"
+    d.mkdir()
+    (d / "awk").write_text(f"#!/bin/sh\ncase $2 in tools=*) {scan_does} ;; esac\nexec '{REAL_AWK}' \"$@\"\n")
+    (d / "awk").chmod(0o755)
+    FAKE_AWKS[name] = f"{d}{os.pathsep}{BASE_PATH}"
+
+
+def pre_pg(cmd, **kw):
+    """pre() in a process group of its own: decision, reason, wall time, CPU time (the hook's) and what
+    it left running (or on stderr)."""
+    payload = json.dumps({"session_id": "s1", "cwd": str(PLAIN), "tool_name": "Bash", "tool_input": {"command": cmd}})
+    r0, t0 = resource.getrusage(resource.RUSAGE_CHILDREN), time.time()
+    p = subprocess.Popen(["sh", str(GUARD), "pre"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, env=env(True, **kw), start_new_session=True)
+    try:
+        out, err = p.communicate(payload, timeout=60)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, 9)
+        out, err = p.communicate()
+    r1, wall = resource.getrusage(resource.RUSAGE_CHILDREN), time.time() - t0
+    cpu = (r1.ru_utime + r1.ru_stime) - (r0.ru_utime + r0.ru_stime)
+    ps = subprocess.run(["ps", "-A", "-o", "pgid=,pid=,args="], capture_output=True, text=True).stdout
+    left = [l.strip()[:80] for l in ps.splitlines() if l.split()[:1] == [str(p.pid)]]
+    if left:
+        try:
+            os.killpg(p.pid, 9)
+        except OSError:
+            pass
+    d = json.loads(out)["hookSpecificOutput"] if out.strip() else {}
+    return (d.get("permissionDecision", "pass"), d.get("permissionDecisionReason", ""), wall, cpu,
+            left + ([err] if err else []))
+
+
+def pre_pg_runs(cmd, wall, **kw):
+    """remeasured() runs of pre_pg() under an upper bound of wall seconds, and their smaller wall time."""
+    rs = remeasured(pre_pg, cmd, wall=wall, **kw)
+    return rs, min(t[2] for t in rs)
+
+
+def pg_detail(rs):
+    """What a failed check shows of pre_pg() runs."""
+    return [(d, r[:60], f"{w:.1f}s", left) for d, r, w, _, left in rs]
+
+
+# Upper wall-time bounds below may take a second run (remeasured()): a scan the watchdog doesn't stop
+# runs its 30 s again, one that waits for its sleeper 7 s again. Lower bounds use the first run alone.
+for cmd, want in (("ls", "deny"), ("python3 x", "deny"), ("PIXI_GUARD=ask ls", "ask")):
+    rs, wall = pre_pg_runs(cmd, 4, PATH=FAKE_AWKS["slow"], PIXI_GUARD_WATCHDOG="1")
+    _, _, wall1, cpu, _ = rs[0]
+    # (the killed awk is waited for, so its CPU time counts: the budget tests above rely on that)
+    check(f"scan stuck, watchdog 1 s: {want} {cmd!r} as too large in {wall:.1f}s ({cpu:.1f}s CPU), nothing left running",
+          all(d == want and "too large" in r and not left for d, r, _, _, left in rs)
+          and 0.9 < wall1 and cpu > 0.5 and wall < 4, pg_detail(rs))
+rs, wall = pre_pg_runs("python3 x", 4, PATH=FAKE_AWKS["failing"])
+check(f"scan's awk failing: fails open in {wall:.2f}s, nothing left running",
+      all(d == "pass" and not left for d, _, _, _, left in rs) and wall < 4, pg_detail(rs))
+for cmd, want in (("ls", "pass"), ("python3 x", "deny"), ("PIXI_GUARD=ask pip list", "ask")):
+    rs, wall = pre_pg_runs(cmd, 4)
+    check(f"scan done in time: {want} {cmd!r} in {wall:.2f}s, its sleeper killed (nothing left running)",
+          all(d == want and "too large" not in r and not left for d, r, _, _, left in rs) and wall < 4, pg_detail(rs))
+if not os.environ.get("PIXI_GUARD_VARIANT"):  # (7 s each: once, not for every variant)
+    for wd in (None, "30"):
+        rs, wall = pre_pg_runs("ls", 8.5, PATH=FAKE_AWKS["slow"], PIXI_GUARD_WATCHDOG=wd)
+        check(f"scan stuck, PIXI_GUARD_WATCHDOG={wd}: refused after the default 7 s ({wall:.1f}s, under the hook's 10 s)",
+              all(d == "deny" and "too large" in r and not left for d, r, _, _, left in rs)
+              and 6.9 < rs[0][2] and wall < 8.5, pg_detail(rs))
 
 print("tool list override")
 check("PIXI_GUARD_TOOLS narrows the list", decision("pytest", PIXI_GUARD_TOOLS="python") == "pass")
@@ -122,6 +1623,7 @@ check("pixi workspace found from a subfolder", str(pixi_proj) in r and "pixi wor
 check("python suggests pixi run", "pixi run python" in r, r)
 r = reason("pip install x", cwd=pixi_proj)
 check("pip suggests pixi add, not pixi run pip", "pixi add" in r and "pixi run pip" not in r, r)
+check("venv console script suggests pixi run", "pixi run uvicorn" in reason(".venv/bin/uvicorn app", cwd=pixi_proj))
 
 pyproj_pixi = TMP / "pyproj-pixi"
 pyproj_pixi.mkdir()
@@ -135,13 +1637,7 @@ r = reason("python x", cwd=py_proj / "pkg")
 check("non-pixi python project", "not on pixi" in r and "pixi:project" in r and str(py_proj) in r, r)
 wrap = r.split("put the wrapper at ")[1].split(" ")[0].rstrip(".")
 check("wrapper path is under the wrap dir", wrap.startswith(str(TMP / "wrap")) and wrap.endswith("/pixi.toml"), wrap)
-
-def wrap_path(d):
-    e = dict(os.environ, PIXI_GUARD_WRAP_DIR=str(TMP / "wrap"), HOME=str(TMP))
-    return subprocess.run(["sh", str(GUARD), "wrap-path", str(d)], capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, env=e).stdout.strip()
-
-
+check("wrapper dir keeps its historic name (name_-cksum)", re.search(r"/pyproj_-\d+/pixi\.toml$", wrap), wrap)
 check("wrap-path from a subfolder matches the refusal", wrap_path(py_proj / "pkg") == wrap, wrap_path(py_proj / "pkg"))
 link = TMP / "link-to-pyproj"
 link.symlink_to(py_proj)
@@ -160,34 +1656,251 @@ req_proj.mkdir()
 check("requirements.txt marks a python project", "not on pixi" in reason("python x", cwd=req_proj))
 check("plain folder: one-off advice", "pixi exec" in reason("python x"))
 
+print("project detection")
+# A git checkout wrapped out of folder, with docs/requirements.txt: the same wrapper from anywhere in it.
+repo = TMP / "repo"
+(repo / "docs").mkdir(parents=True)
+(repo / ".git").mkdir()
+(repo / "pyproject.toml").write_text("[project]\nname='r'\n")
+(repo / "docs" / "requirements.txt").write_text("sphinx\n")
+r = reason("python x", cwd=repo / "docs")
+check("in git, the root is the outermost marker", f"{repo} is a Python project" in r, r)
+check("wrap-path from docs/ names the repo root's wrapper", wrap_path(repo / "docs") == wrap_path(repo))
+m = Path(wrap_path(repo))
+m.parent.mkdir(parents=True)
+m.write_text("[workspace]\n")
+check("wrapped repo is seen from docs/", f"{repo} is wrapped by" in reason("python x", cwd=repo / "docs"))
+check("wrapped repo is seen from its root", f"{repo} is wrapped by" in reason("python x", cwd=repo))
+# A wrapper made by 0.1.0, keyed by the nearest marker folder, is still found.
+old = TMP / "oldrepo"
+(old / "sub").mkdir(parents=True)
+(old / ".git").mkdir()
+(old / "pyproject.toml").write_text("[project]\nname='o'\n")
+(old / "sub" / "requirements.txt").write_text("x\n")
+sub_manifest = TMP / "wrap" / f"sub_-{subprocess.run(['cksum'], input=str(old / 'sub'), capture_output=True, text=True).stdout.split()[0]}" / "pixi.toml"
+sub_manifest.parent.mkdir(parents=True)
+sub_manifest.write_text("[workspace]\n")
+r = reason("python x", cwd=old / "sub")
+check("a wrapper at a nearer marker level is found", str(sub_manifest) in r and "is wrapped by" in r, r)
+# Markers above the git top level do not count.
+outer = TMP / "outer"
+(outer / "plainrepo").mkdir(parents=True)
+(outer / "pyproject.toml").write_text("[project]\nname='x'\n")
+(outer / "plainrepo" / ".git").write_text("gitdir: /elsewhere\n")  # a worktree's .git is a file
+check("markers above the git top level are ignored", "No pixi workspace here" in reason("python x", cwd=outer / "plainrepo"))
+# Outside git, the nearest marker is the root.
+nogit = TMP / "nogit" / "a" / "b"
+nogit.mkdir(parents=True)
+(TMP / "nogit" / "a" / "pyproject.toml").write_text("[project]\nname='a'\n")
+(nogit / "requirements.txt").write_text("x\n")
+check("outside git, the nearest marker is the root", f"{nogit} is a Python project" in reason("python x", cwd=nogit))
+# $HOME itself is never a project, even through a symlinked HOME.
+home = TMP / "home"
+(home / "work" / "plain").mkdir(parents=True)
+(home / ".python-version").write_text("3.12\n")
+homelink = TMP / "homelink"
+homelink.symlink_to(home)
+for h in (home, homelink):
+    r = reason("python x", cwd=home / "work" / "plain", HOME=str(h))
+    check(f"HOME with .python-version is not a project (HOME={h.name})", "No pixi workspace here" in r, r)
+(home / "pixi.toml").write_text("[workspace]\n")
+check("a pixi workspace at HOME still counts", "pixi workspace" in reason("python x", cwd=home / "work", HOME=str(home)))
+(home / "pixi.toml").unlink()
+
+print("reason JSON escaping")
+odd = TMP / 'we"ird\\pa\tth\x01x'
+odd.mkdir()
+(odd / "setup.py").write_text("")
+out, err = pre("python x", cwd=odd)
+r = out.get("hookSpecificOutput", {}).get("permissionDecisionReason", "") if out else ""
+check("path with quote, backslash, tab and control char round-trips", f"{odd} is a Python project" in r, (r, err))
+check("hit name with a backslash round-trips", hit('"./we\\ird.py" a') == "we\\ird.py", hit('"./we\\ird.py" a'))
+check("hit name control characters are masked", hit("./a\x01b.py") == "a?b.py", hit("./a\x01b.py"))
+
 print("pixi missing")
 r1 = reason("python x", pixi=False, sid="m1")
-check("first refusal tells the user", "not installed" in r1 and "tell the user" in r1, r1)
+check("first refusal tells the user", "not found" in r1 and "tell the user" in r1 and "command -v pixi" in r1, r1)
 r2 = reason("python x", pixi=False, sid="m1")
 check("later refusals are short", "has been told" in r2, r2)
 check("other sessions are told again", "tell the user" in reason("python x", pixi=False, sid="m2"))
 check("pixi missing: still allows non-python", decision("ls", pixi=False) == "pass")
+data = TMP / "plugin-data"
+reason("python x", pixi=False, sid="d1", PIXI_GUARD_HOME=None, CLAUDE_PLUGIN_DATA=str(data))
+check("told markers go under CLAUDE_PLUGIN_DATA", (data / "told" / "d1").exists())
+check("... and nothing under the XDG state dir", not (TMP / ".local" / "state" / "pixi-guard").exists())
+reason("python x", pixi=False, sid="x1", PIXI_GUARD_HOME=None)
+check("without CLAUDE_PLUGIN_DATA, markers use the XDG state dir",
+      (TMP / ".local" / "state" / "pixi-guard" / "told" / "x1").exists())
+stale = data / "told" / "stale"
+stale.write_text("")
+os.utime(stale, (time.time() - 30 * 86400,) * 2)
+reason("python x", pixi=False, sid="d2", PIXI_GUARD_HOME=None, CLAUDE_PLUGIN_DATA=str(data))
+check("old told markers are pruned", not stale.exists() and (data / "told" / "d2").exists())
+# Markers 0.1.0 left in the XDG state dir are pruned too (and the dir once empty), at a refusal or a session start.
+for when in ("refusal", "session start"):
+    h = TMP / ("oldstate-" + when.replace(" ", "-"))
+    old_told = h / ".local" / "state" / "pixi-guard" / "told"
+    old_told.mkdir(parents=True)
+    (old_told / "ancient").write_text("")
+    os.utime(old_told / "ancient", (time.time() - 30 * 86400,) * 2)
+    kw = dict(pixi=False, HOME=str(h), PIXI_GUARD_HOME=None, CLAUDE_PLUGIN_DATA=str(h / "data"))
+    if when == "refusal":
+        reason("python x", sid="o1", **kw)
+    else:
+        session(**kw)
+    check(f"0.1.0 told markers are pruned at a {when}, and their empty dir removed",
+          not (h / ".local" / "state" / "pixi-guard").exists(), list(h.rglob("*")))
+recent = TMP / "oldstate-recent" / ".local" / "state" / "pixi-guard" / "told"
+recent.mkdir(parents=True)
+(recent / "fresh").write_text("")
+session(pixi=False, HOME=str(TMP / "oldstate-recent"), PIXI_GUARD_HOME=None, CLAUDE_PLUGIN_DATA=str(TMP / "d3"))
+check("recent 0.1.0 told markers are kept", (recent / "fresh").exists())
+
+print("finding pixi")
+for label, setup, extra in (
+    ("~/.pixi/bin", lambda h: h / ".pixi" / "bin", {}),
+    ("$PIXI_HOME/bin", lambda h: h / "custom-pixi-home" / "bin", {"PIXI_HOME": "custom-pixi-home"}),
+    ("~/.local/bin", lambda h: h / ".local" / "bin", {}),
+):
+    h = TMP / ("findhome-" + re.sub(r"\W", "", label))
+    b = setup(h)
+    b.mkdir(parents=True)
+    shutil.copy(FAKE_PIXI, b / "pixi")
+    kw = {k: str(h / v) for k, v in extra.items()}
+    out, _ = session(pixi=None, HOME=str(h), PATH=NOPIXI_PATH, **kw)
+    ctx = out.get("hookSpecificOutput", {}).get("additionalContext", "")
+    check(f"pixi in {label} is found off PATH", "systemMessage" not in out and str(b / "pixi") in ctx, out)
+    check(f"pixi in {label}: refusals give pixi advice",
+          "pixi exec" in reason("python x", pixi=None, HOME=str(h), PATH=NOPIXI_PATH, **kw))
+r = subprocess.run(["sh", str(PIXI_SH), "run", "x y"], capture_output=True, text=True, env=env(True))
+check("pixi.sh runs pixi with its arguments", r.stdout.strip() == "fake pixi run x y", r)
+r = subprocess.run(["sh", str(PIXI_SH), "--version"], capture_output=True, text=True, env=env(False))
+check("pixi.sh without pixi: exit 127 and a pointer to pixi.sh", r.returncode == 127 and "https://pixi.sh" in r.stderr, r)
 
 print("session start")
-out, _ = run("session", {"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup"})
+out, _ = session()
 ctx = out["hookSpecificOutput"]["additionalContext"]
-check("policy context", "pixi" in ctx and "pixi:project" in ctx)
-check("no missing notice when pixi exists", "NOT installed" not in ctx)
-out, _ = run("session", {"session_id": "s1"}, pixi=False)
-check("missing notice without pixi", "NOT installed" in out["hookSpecificOutput"]["additionalContext"])
+check("policy context", "pixi" in ctx and "pixi:project" in ctx and "Monitor" in ctx and "terminal" in ctx)
+check("policy context: checkpoint's job_start, with the pixi way for a job's command",
+      "job_start" in ctx and "`pixi run python train.py`" in ctx, ctx)
+check("no missing notice when pixi exists", "not found" not in ctx and "systemMessage" not in out)
+out, _ = session(pixi=False)
+check("missing pixi: context says so", "not found" in out["hookSpecificOutput"]["additionalContext"])
+check("missing pixi: the user sees a notice naming https://pixi.sh", "https://pixi.sh" in out.get("systemMessage", ""), out)
+
+print("skill")
+skill = (ROOT / "skills" / "project" / "SKILL.md").read_text()
+check("skill finds the hook via ${CLAUDE_PLUGIN_ROOT}", "${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh" in skill)
+check("skill never restores files with git checkout --", "checkout --" not in skill)
+check("skill warns that a worktree's exclude rules are shared by every checkout", "every checkout" in skill and "git add -f" in skill)
+snippet = re.search(r"In a git checkout.*?```bash\n(.*?)```", skill, re.S).group(1)
+if shutil.which("git"):
+    fake = TMP / "skillbin"
+    fake.mkdir()
+    # Like pixi 0.81 init: writes pixi.toml and appends to .gitignore / .gitattributes.
+    (fake / "pixi").write_text('#!/bin/sh\n[ "$1" = init ] || exit 1\nfor a; do d=$a; done\nmkdir -p "$d"\n'
+                               'printf \'[workspace]\\nname = "%s"\\n\' "$(basename "$d")" > "$d/pixi.toml"\n'
+                               'echo ".pixi/" >> "$d/.gitignore"\necho "pixi.lock -diff" >> "$d/.gitattributes"\n')
+    (fake / "pixi").chmod(0o755)
+    genv = dict(env(True), PATH=f"{fake}{os.pathsep}{os.environ['PATH']}", GIT_CONFIG_GLOBAL="/dev/null",
+                GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                GIT_COMMITTER_EMAIL="t@t")
+
+    def git(cwd, *a):
+        return subprocess.run(["git", *a], cwd=cwd, env=genv, capture_output=True, text=True)
+
+    up = TMP / "upstream"
+    (up / "pkg").mkdir(parents=True)
+    git(up, "init", "-q", ".")
+    (up / ".gitignore").write_text("mine/\n")
+    (up / "pkg" / "pyproject.toml").write_text("[project]\nname='p'\n")
+    git(up, "add", ".")
+    git(up, "commit", "-qm", "init")
+    (up / ".gitignore").write_text("mine/\nuncommitted/\n")  # the user's unsaved edit
+    wt = TMP / "upstream-wt"
+    git(up, "worktree", "add", "-q", str(wt))
+    for where, cwd in (("checkout subfolder", up / "pkg"), ("worktree", wt)):
+        before = git(cwd, "status", "--porcelain").stdout
+        r = subprocess.run(["sh", "-c", snippet], cwd=cwd, env=genv, capture_output=True, text=True)
+        after = git(cwd, "status", "--porcelain").stdout
+        check(f"skill wrap snippet works in a {where}", r.returncode == 0 and (cwd / "pixi.toml").exists(), r.stderr)
+        check(f"skill wrap snippet: git status unchanged in a {where}", before == after, (before, after))
+    check("skill wrap snippet keeps the user's .gitignore edit", "uncommitted/" in (up / ".gitignore").read_text())
+    check("skill wrap snippet: pixi.toml named after the project", 'name = "pkg"' in (up / "pkg" / "pixi.toml").read_text())
+
+print("version")
+pj = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
+ver = pj["version"]
+check("plugin.json version is semver", re.fullmatch(r"\d+\.\d+\.\d+", ver), ver)
+mk = json.loads((REPO / ".claude-plugin" / "marketplace.json").read_text())
+entry = [p for p in mk["plugins"] if p["name"] == pj["name"]]
+check("marketplace lists the plugin by its name", len(entry) == 1, entry)
+check("marketplace entry has no conflicting version", entry and entry[0].get("version", ver) == ver)
+md = re.search(r"plugin name `[^`]+`, v(\d+\.\d+\.\d+)", (REPO / "CLAUDE.md").read_text())
+check("CLAUDE.md states the plugin.json version", md and md.group(1) == ver, md and md.group(1))
+check("no top-level bin/ in the plugin", not (ROOT / "bin").exists())
 
 print("robustness")
 out, _ = run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": "Bash",
                      "tool_input": {"command": "python \"x\\ty\" é \\u00e9"}})
 check("escapes in payload still parse to a deny", out and out["hookSpecificOutput"]["permissionDecision"] == "deny")
+out, _ = run("pre", None, raw='{"session_id":"s1","tool_input":{"command":"echo \\"a\\\\\\" b\\" \\u0026\\u0026 python x"}}')
+check("escaped quotes and \\u escapes decode", out and out["hookSpecificOutput"]["permissionDecision"] == "deny", out)
+out, _ = run("pre", None, raw='{"tool_input":{"description":"say \\"command\\": \\"python\\"","command":"ls"}}')
+check("a quoted \"command\" inside another value is not the command", out is None, out)
 r = reason('python "a\\b"', cwd=PLAIN)
 check("reason is valid JSON with quotes/backslashes", "pixi-guard" in r)
 out, err = run("pre", {"tool_name": "Bash"})
 check("no command: no output", out is None and not err)
-r = subprocess.run(["sh", str(GUARD), "pre"], input="not json", capture_output=True, text=True)
+r = subprocess.run(["sh", str(GUARD), "pre"], input="not json", capture_output=True, text=True, env=env(True))
 check("garbage input fails open", r.stdout == "" and r.returncode == 0)
 big = "echo " + "a" * 50000 + " && python x"
 check("long command still scanned", decision(big) == "deny")
+check("many command substitutions are all scanned", hit("echo " + "$(true) " * 6000 + "$(python x)") == "python")
+
+print("speed (~240KB, under the 256KB limit; about 1 s CPU here, quadratic code takes 10 s+; the hook timeout is 10 s)")
+body = "Don't use pip (it's slow): run `pip install -e .` (or $(python -m x))\n" * 3300
+for label, cmd, want in (
+    ("heredoc file body", f"cat > notes.md <<'EOF'\n{body}EOF\npython x", "deny"),
+    ("commit message", f"git commit -m \"$(cat <<'EOF'\n{body}EOF\n)\" && python x", "deny"),
+    ("commit message, nothing after", f"git commit -m \"$(cat <<'EOF'\n{body}EOF\n)\"", "pass"),
+    ("one long quoted word", "echo '" + "a" * 240000 + "' && python x", "deny"),
+    ("one long bare word", "echo " + "a" * 240000 + " && python x", "deny"),
+    ("many words", "echo " + "ab " * 80000 + "&& python x", "deny"),
+    ("many lines", "ls -la\n" * 34000 + "python x", "deny"),
+    ("escaped double quotes", 'echo "' + 'a\\"b ' * 48000 + '" && python x', "deny"),
+    ("bash -c script", "bash -c '" + "echo hi; " * 26000 + "python x'", "deny"),
+    ("$'..' in $(...)", "x=$(printf $'it\\'s'); " * 10800 + "python x", "deny"),
+    ("case in $(...)", "x=$(case $t in pip) echo 1;; esac); " * 6500 + "ls", "pass"),
+    ("case patterns", "case $x in " + "pip|uv) echo;; " * 15000 + "esac; python x", "deny"),
+    ("heredoc pipelines", "cat <<E | " * 5000 + "cat\n" + "x\nE\n" * 5000 + "python x", "deny"),
+    ("${...} with quotes", "echo ${x:-\"}\"} " * 16000 + "; python x", "deny"),
+    ("backticks with \\$", "echo `echo \\$x` " * 15000, "pass"),
+    ("many sh -c strings", "sh -c x; " * 26000 + "sh -c 'python x'", "deny"),
+    ("{ } groups", "{ echo a; } " * 20000 + "; python x", "deny"),
+    ("arrays", "a=(1 2 3); " * 22000 + "python x", "deny"),
+    # heredocs waiting for their bodies in $(...): a stack, not a growing string (that took 8 s+)
+    ("heredocs in $(...)", ": $(cat " + "<<a" * 48000 + "\n" + "a\n" * 48000 + ")\npython3 x", "deny"),
+    ("$[ without ] repeated", "echo $[ ;" * 26000 + "\npython3 x", "deny"),
+    ("${...} read again for zsh", "echo \"${x:-'}'}\" " * 14000 + "; python3 x", "deny"),
+    ("(( )) repeated", "(( i++ )); " * 21000 + "python3 x", "deny"),
+    ("$(( )) repeated", "echo $(( i + 1 )); " * 12000 + "python3 x", "deny"),
+    ("$(( )) with ( ) in it", "x=$(( (a + b) * 2 )); " * 10000 + "ls", "pass"),
+    # a glob word of many groups (each "(" looked at the whole word so far: 30 s)
+    ("one glob word of @(...) groups", "ls " + "@(a|b)" * 40000 + "; python3 x", "deny"),
+    ("one glob word of zsh (...) groups", "ls " + "(a|b)" * 48000 + "; python3 x", "deny"),
+    ("one glob word of !(...) groups", "ls " + "!(*.py)" * 34000 + "; ls", "pass"),
+    ("glob words of groups", "ls " + "*(.)@(a) " * 26000 + "; python3 x", "deny"),
+    # a "((" or "$((" whose "))" never comes is not looked for again after it
+    ("unbalanced (", "(" * 200000 + "ls", "pass"),
+    ("(( with no ))", "(( " * 80000 + "\npython3 x", "deny"),
+):
+    # CPU time of the hook's processes: steadier under machine load than wall time (shown only).
+    r, cpu, wall = budgeted(reason, cmd)
+    got = "deny" if r else "pass"
+    check(f"{label} ({len(cmd) // 1000}KB): {want}, {cpu:.2f}s CPU, {wall:.2f}s",
+          got == want and "too large" not in r and len(cmd) < 262144 and cpu < CPU, (got, r[:80]))
 
 print(f"\n{PASS} passed, {FAIL} failed")
+shutil.rmtree(TMP, ignore_errors=True)
 sys.exit(1 if FAIL else 0)
