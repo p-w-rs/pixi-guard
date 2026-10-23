@@ -29,19 +29,6 @@ Some checks measure the hook's CPU time against a budget, and run once more
 before failing. On a heavily loaded machine a timing check can still fail;
 run it again before looking for a bug.
 
-## CI
-
-[`.github/workflows/test.yml`](../../.github/workflows/test.yml) runs the
-suite and the matrix on each push to `main`, each pull request, on demand,
-and weekly with the newest pixi:
-
-- ubuntu-24.04, ubuntu-24.04-arm, macos-15 and macos-15-intel, with pixi
-  0.81.0;
-- ubuntu-24.04 with pixi 0.68.0, the oldest pixi tested, as well.
-
-It installs gawk, mawk, busybox and dash on Linux, and gawk and mawk on
-macOS, so CI runs the variants a machine without them skips.
-
 ## 0.3.0 verification
 
 Run on 2026-10-22 and 23 (Claude Code 2.1.301 on macOS, 2.1.304 on Linux).
@@ -66,6 +53,6 @@ Run on 2026-10-22 and 23 (Claude Code 2.1.301 on macOS, 2.1.304 on Linux).
   `plugins/data/pixi-guard-pixi-guard`.
 - Not run: busybox awk, the gateway's real `job_start` and `terminal_send`
   in a live session (the suite feeds the hook inputs shaped like theirs), the
-  skill's convert, wrap and unwrap in a live session, a first CI run, an
+  skill's convert, wrap and unwrap in a live session, an
   install from GitHub of the released version.
 

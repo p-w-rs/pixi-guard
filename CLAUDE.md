@@ -272,3 +272,5 @@ copies never update, and add its entry to CHANGELOG.md.
   settings.
 - Plain, concise docs. No license file and no license wording (the user's
   decision, 2026-10-22).
+- A hobby project: no CI/CD (no GitHub Actions) and no enterprise-style
+  release process.

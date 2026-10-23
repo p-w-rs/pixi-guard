@@ -35,7 +35,7 @@ Added:
 - README: an "Update, disable, uninstall" section (what stays behind and how
   to remove it) and requirements. New: this changelog,
   [SECURITY.md](SECURITY.md), [docs/dev/LIMITS.md](docs/dev/LIMITS.md),
-  [docs/dev/TESTING.md](docs/dev/TESTING.md), and CI on Linux and macOS.
+  [docs/dev/TESTING.md](docs/dev/TESTING.md).
 - `plugin.json` links the repository.
 
 Fixed:
