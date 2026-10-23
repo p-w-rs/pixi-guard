@@ -59,6 +59,9 @@ claude plugin marketplace update pixi-guard
 claude plugin install pixi-guard@pixi-guard
 ```
 
+If you added the marketplace with a tag (`p-w-rs/pixi-guard#v0.2.0`), the
+update keeps that tag: run `claude plugin marketplace remove pixi-guard` and
+`claude plugin marketplace add p-w-rs/pixi-guard` instead of the update.
 Your wrappers and converted projects are kept.
 
 **Requirements.** macOS or Linux with `sh` and `awk`: the hook needs neither
