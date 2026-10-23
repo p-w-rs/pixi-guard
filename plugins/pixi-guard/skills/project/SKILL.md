@@ -1,6 +1,6 @@
 ---
 name: project
-description: Put a Python project on pixi. Use when pixi-guard refuses a command in a Python project that has no pixi workspace, or when the user asks to convert a project to pixi or to run someone else's Python code through pixi. Covers converting (the user's own code) and wrapping without touching tracked files (someone else's code).
+description: Put a Python project on pixi. Use when pixi-guard refuses a command in a Python project that has no pixi workspace, or when the user asks to convert a project to pixi or to run someone else's Python code through pixi. Covers converting (the user's own code), wrapping without touching tracked files (someone else's code), and removing a wrapper (unwrapping).
 ---
 
 # Put a project on pixi
@@ -67,8 +67,9 @@ p=$(git rev-parse --show-prefix) &&
 printf '/%s%s\n' "$p" pixi.toml "$p" pixi.lock "$p" .pixi/ >> "$ex"
 ```
 
-In a worktree, `info/exclude` is shared by every checkout of the repo, so
-these lines hide a `pixi.toml` at the same path in the other checkouts too.
+`info/exclude` belongs to this clone and is shared by every worktree of
+it, so these lines hide a `pixi.toml` at the same path in the other
+worktrees too.
 Tell the user; converting one of them later needs `git add -f pixi.toml
 pixi.lock` (or those lines removed from the exclude file).
 
@@ -103,3 +104,44 @@ command (they may want a shell alias).
 
 One or two lines: what was done (converted / wrapped, where the manifest is),
 and how they run things now (`pixi run test`, `pixi run python ...`).
+
+## 4. Remove a wrapper
+
+When the user asks to unwrap a project, remove only what the wrapper added.
+Tell the user what will be deleted first: the `.pixi/` environment can take
+gigabytes, and a deleted `pixi.lock` can't be got back.
+
+**In a git checkout:** from the project root. First run `git ls-files
+pixi.toml pixi.lock`: if it prints a name, that file is tracked, so it is
+the project's own and not a wrapper's; stop there. Otherwise delete the
+manifest, the lock file and the environment:
+
+```bash
+rm -f pixi.toml pixi.lock && rm -rf .pixi
+```
+
+Then the three lines that hid them, unless another worktree of this clone
+still has a wrapper at the same path (they all share the exclude file):
+
+```bash
+ex=$(git rev-parse --git-path info/exclude) && p=$(git rev-parse --show-prefix) && [ -f "$ex" ] &&
+{ grep -vxF -e "/${p}pixi.toml" -e "/${p}pixi.lock" -e "/${p}.pixi/" "$ex" > "$ex.new"; [ $? -le 1 ]; } &&
+mv "$ex.new" "$ex"
+```
+
+Afterwards `git status` shows nothing new.
+
+**Outside the folder:** the wrapper is the folder that holds the manifest
+pixi-guard picks (`pixi.toml`, `pixi.lock`, `.pixi/`). From the project
+folder, print its path:
+
+```bash
+sh "${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh" wrap-path .   # .../pixi-guard/wrap/<name>_-<sum>/pixi.toml
+```
+
+If that `pixi.toml` exists, delete the folder it is in by its literal path:
+`rm -rf` the printed path without its `/pixi.toml`, written out, not a
+`$(...)`.
+
+Then tell the user it is gone: `pixi run` no longer works there, and the
+project counts as not on pixi again.

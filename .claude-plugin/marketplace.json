@@ -8,7 +8,7 @@
   },
   "plugins": [
     {
-      "name": "pixi",
+      "name": "pixi-guard",
       "source": "./plugins/pixi-guard",
       "description": "Keep Python on pixi: no python/pip/uv/conda outside pixi without the user's yes; convert or wrap non-pixi projects."
     }

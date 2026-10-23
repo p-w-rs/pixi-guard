@@ -46,7 +46,7 @@ BASE_PATH = os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.paths
 # PATH without any pixi on it either, for the "find pixi off PATH" tests.
 NOPIXI_PATH = os.pathsep.join(d for d in BASE_PATH.split(os.pathsep) if not os.access(os.path.join(d, "pixi"), os.X_OK))
 SCRUB = ("PIXI_GUARD_TOOLS", "PIXI_GUARD_PIXI", "PIXI_GUARD_HOME", "PIXI_GUARD_WRAP_DIR", "PIXI_GUARD_WATCHDOG", "PIXI_GUARD_JOB_SH", "PIXI_HOME",
-         "CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "XDG_STATE_HOME", "XDG_DATA_HOME",
+         "CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR", "XDG_STATE_HOME", "XDG_DATA_HOME",
          # read by the hook: Claude Code's shell (bash 3.x reads $(...) its own way), the active envs
          "SHELL", "CLAUDE_CODE_SHELL", "VIRTUAL_ENV", "CONDA_PREFIX")
 
@@ -61,7 +61,9 @@ def check(name, cond, detail=""):
         print(f"  ok   {name}")
     else:
         FAIL += 1
-        print(f"  FAIL {name} {detail}")
+        # (on one line, so the matrix, which keeps only the FAIL lines, shows all of it)
+        d = str(detail)
+        print(f"  FAIL {name} {d if chr(10) not in d else repr(d)}")
 
 
 CPU = 4  # seconds of CPU one hook call may take in the budget checks (about 1 s for 256KB; the watchdog is at 7 s)
@@ -337,8 +339,11 @@ out, err = run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": "Moni
 check("Monitor without a command: no output", out is None and not err, (out, err))
 hooks = json.loads((ROOT / "hooks" / "hooks.json").read_text())["hooks"]
 names = [n.strip() for n in re.split(r"[|,]", hooks["PreToolUse"][0]["matcher"])]
+# the gateway's tools (plugin gate, MCP server gw): job_start {command | argv, cwd, host, ...}, terminal_send {id, seq, text, ...}
+GWJOB, GWSEND = "mcp__plugin_gate_gw__job_start", "mcp__plugin_gate_gw__terminal_send"
 check("PreToolUse matcher lists Bash, Monitor, the terminal tool and checkpoint's job_start",
       {"Bash", "Monitor", TERMINAL, JOB} <= set(names) and re.fullmatch(r"[A-Za-z0-9_|]+", hooks["PreToolUse"][0]["matcher"]), names)
+check("PreToolUse matcher lists the gateway's job_start and terminal_send", {GWJOB, GWSEND} <= set(names), names)
 
 print("hooks.json: exec form")
 for event, mode in (("SessionStart", "session"), ("PreToolUse", "pre")):
@@ -446,9 +451,9 @@ r = jreason(argv=["pip", "install", "torch"], session_cwd=jws)
 check("job refusal for pip: pixi add, not pixi run pip", "pixi add" in r and "pixi run pip" not in r, r)
 r = jreason(argv=["pytest", "-q"], session_cwd=jpy)
 check("job refusal in a Python project not on pixi: the skill, then the job's command",
-      "pixi:project" in r and "Then make the job's command `pixi run pytest ...`" in r, r)
+      "pixi-guard:project" in r and "Then make the job's command `pixi run pytest ...`" in r, r)
 r = jreason(argv=["pip", "install", "torch"], session_cwd=jpy)
-check("... for pip: the skill, then pixi add", "pixi:project" in r and "Then manage packages with `pixi add" in r and "pixi run pip" not in r, r)
+check("... for pip: the skill, then pixi add", "pixi-guard:project" in r and "Then manage packages with `pixi add" in r and "pixi run pip" not in r, r)
 r = jreason(argv=["python", "train.py"])
 check("job refusal with no workspace: pixi exec as the job's command",
       "No pixi workspace here" in r and "The job's command is then that pixi command, such as `pixi exec --spec python python ...`" in r, r)
@@ -556,7 +561,7 @@ for label, payload, want, big in (
     ("PIXI_GUARD=ask, 300KB", dict(argv=["PIXI_GUARD=ask", "make"] + ["ab"] * 100000), "ask", True),
     ("1.8MB of \\u escapes", '["echo","' + "\\u0061" * 300000 + '"]', "deny", True),
     ("1.7MB of blanks in the list (cut before its ])", '["ls",' + " " * 1700000 + '"python"]', "deny", True),
-    ("1.7MB after the list's ]", '["ls"],"x":"' + "a" * 1700000 + '"', "pass", False),
+    ("0.9MB after the list's ]", '["ls"],"x":"' + "a" * 900000 + '"', "pass", False),
 ):
     if isinstance(payload, str):
         data = ('{"session_id":"s1","cwd":' + json.dumps(str(PLAIN)) + ',"tool_name":"' + JOB
@@ -932,6 +937,23 @@ expect("pass", ["taskset -p 1234", "taskset -pc 0 1234", "chrt -p 1234", "flock 
                 "mise use python@3.12", "mise exec node -- node app.js", "setsid -f make", "strace -c ls",
                 "flock /tmp/l -c 'pixi run python x'", "xvfb-run pixi run pytest"])
 
+print("wrappers: the gateway's gate with NAME -- CMD, xcrun")
+expect("deny", [
+    "gate with openai -- python train.py", "gate with hf -- pip install x", "gate with openai -- uv run x.py",
+    "sudo -n gate with openai -- python x", "gate with openai -- sh -c 'python x'", "gate with openai -- env A=1 pytest -q",
+    "cd a && gate with openai -- python3 x", "xcrun python3 x.py", "xcrun -sdk macosx python3 x.py", "xcrun --sdk macosx pip3 list",
+    "xcrun -toolchain t -r python3 -V", "xcrun -log -verbose python3 x", "xcrun -no-cache pytest",
+])
+expect("pass", [
+    # the gateway's README example; gate's other commands; usage errors (gate runs nothing)
+    "gate with openai -- pixi run python train.py", "gate with openai -- curl -s https://example.com", "gate status",
+    "gate why python", "gate with -- python x", "gate with a b -- python x", "gate with openai python x",
+    "echo gate with openai -- python x", "gate with openai --",
+    # xcrun: -f only prints where a tool is
+    "xcrun -f python3", "xcrun --find python3", "xcrun -find pip3", "xcrun --show-sdk-path", "xcrun -show-sdk-platform-path",
+    "xcrun clang -v", "xcrun simctl list", "xcrun -sdk iphoneos clang x.c",
+])
+
 print("screen, tmux, trap")
 expect("deny", [
     "screen -dmS s python3 app.py", "screen -dm bash -c 'python3 app.py'", "screen -S s -X stuff 'python3 app.py\\n'",
@@ -943,6 +965,11 @@ expect("deny", [
 expect("pass", ["screen -ls", "screen -r s", "screen -S s -X quit", "tmux ls", "tmux attach -t s",
                 "tmux new -d 'pixi run python app.py'", "tmux new -d pixi run python app.py", "tmux send-keys -t s 'ls' Enter",
                 "trap 'rm -f x' EXIT", "trap -p", "trap - EXIT", "echo trap python3"])
+
+print("alias NAME=VALUE: VALUE is code (it runs where NAME is typed as a command)")
+expect("deny", ["alias p=python", "alias p=python; p x.py", "alias p='pip install'", "alias -- p=python3", "alias -s py=python",
+                "alias ll='ls -l' p='uv run x'", "alias t=\"python3 -V\""])
+expect("pass", ["alias", "alias ll", "alias ll='ls -l'", "alias p='pixi run python'", "alias -p", "unalias p", "echo alias p=python"])
 
 print("xargs running a shell: its code may come from stdin")
 expect("deny", ["echo 'pip -V' | xargs -0 sh -c", "echo python3 | xargs sh -c", "printf 'python3 -V' | xargs -I{} sh -c '{}'",
@@ -1182,6 +1209,231 @@ if sh_ver[0] == 3 or sh_ver == (0, 0):
     if want == "deny" and 3 in real:
         check("the real /bin/sh runs the tool in that job", runs_tool("/bin/sh", b32_deny[0]))
 
+print("the gateway's job_start: its command or argv, read as the gateway's own bash (5.2); a job on another host is not checked")
+NOHOST = object()
+ph = hooks["PreToolUse"][0]["hooks"][0]
+
+
+def gwjob(command=None, argv=None, cwd=None, host=NOHOST, session_cwd=PLAIN, sid="s1", extra=None, **kw):
+    ti = dict(extra or {})
+    if command is not None:
+        ti["command"] = command
+    if argv is not None:
+        ti["argv"] = argv
+    if cwd is not None:
+        ti["cwd"] = str(cwd)
+    if host is not NOHOST:
+        ti["host"] = host
+    ti["on_pause"] = "continue"
+    return run("pre", {"session_id": sid, "transcript_path": "/x", "cwd": str(session_cwd),
+                       "hook_event_name": "PreToolUse", "tool_name": GWJOB, "tool_input": ti}, **kw)
+
+
+def gwdecision(**kw):
+    return verdict(*gwjob(**kw))
+
+
+def gwreason(**kw):
+    return why(gwjob(**kw)[0])
+
+
+# The gateway's job runs `bash --noprofile --norc FILE`, FILE ending in the command, or in argv joined with shlex.quote.
+for command, argv, want in JOB_PAIRS:
+    got = gwdecision(command=command)
+    check(f"{want:5} gateway job command {command!r}", got == want, got)
+    got = gwdecision(argv=argv)
+    check(f"{want:5} gateway job argv {argv!r}", got == want, got)
+for argv, command in JOB_QUOTED:
+    got = gwdecision(argv=argv)
+    check(f"pass  gateway job argv {argv!r}: one word each", got == "pass", got)
+for argv, want in ((["gate", "with", "openai", "--", "python", "train.py"], "deny"),
+                   (["gate", "with", "openai", "--", "pixi", "run", "python", "train.py"], "pass"),
+                   (["pixi", "run", "pip", "install", "torch"], "deny"), (["pixi", "run", "pip", "list"], "pass")):
+    got = gwdecision(argv=argv)
+    check(f"{want:5} gateway job argv {argv!r}", got == want, got)
+GWID = "m_" + "abcdefghijklmnopqrstuvwxyz"[:20] + "234567"  # an id of this machine (or another) as the gateway names it
+for label, host, want in (("no host given", NOHOST, "deny"), ("localhost", "localhost", "deny"), ('""', "", "deny"),
+                          ("null", None, "deny"), ("an m_ id (this machine's, to the gateway, may be)", GWID, "deny"),
+                          ("a host named in gateway.toml", "gpu1", "pass"), ("a host name that is no m_ id", "m_gpu", "pass"),
+                          ("an m_ word too long for an id", GWID + "a", "pass"), ("an m_ word with capitals", "m_" + "A" * 26, "pass"),
+                          ("LOCALHOST (not the gateway's word for this machine)", "LOCALHOST", "pass")):
+    for kw in ({"command": "python train.py"}, {"argv": ["python", "train.py"]}):
+        got = gwdecision(host=host, **kw)
+        check(f"{want:5} gateway job on {label} ({list(kw)[0]})", got == want, got)
+r = gwreason(command="python train.py", host=GWID)
+check("gateway job on an m_ id: the reason says jobs on other hosts are not checked (name the host)",
+      "another machine's id" in r and "gateway.toml" in r, r)
+check("gateway job on localhost: no such note", "another machine's id" not in gwreason(command="python train.py", host="localhost"))
+for cmd in b52_deny[:3]:
+    got = gwdecision(command=cmd)
+    check(f"deny  gateway job, its bash 5.2, Claude Code's shell zsh: {cmd[:50]!r}", got == "deny", got)
+    got = gwdecision(command=cmd, host="gpu1")
+    check(f"pass  gateway job on another host: {cmd[:50]!r}", got == "pass", got)
+r = gwreason(command=b52_deny[0])
+check("gateway job, bash 5.2: the note says the gateway runs it with its own bash",
+      "the gateway runs the job with its own bash, which is bash 5.2" in r and "checkpoint" not in r and "Claude Code's shell" not in r, r)
+for cmd in b32_deny[:2]:
+    for label, kw in (("Claude Code's shell", B32), ("/bin/sh", JSH32)):
+        got = gwdecision(command=cmd, **kw)
+        check(f"pass  gateway job, {label} bash 3.2 (not the job's shell): {cmd[:40]!r}", got == "pass", got)
+# With no cwd, the gateway's MCP server runs a local job in CLAUDE_PROJECT_DIR (else its own folder, the
+# project's): not the session's folder, which a cd may have changed.
+WS = {"workspace": "w_" + "a" * 26}
+for label, kw, want in (
+    ("a pixi #! line in the job's cwd", dict(argv=["./x.py"], cwd=pixi_x), "pass"),
+    ("a python #! line in the job's cwd", dict(argv=["./x.py"], cwd=plain_x), "deny"),
+    ("the job's cwd counts, not the session's", dict(command="./x.py", cwd=plain_x, session_cwd=pixi_x), "deny"),
+    ("no cwd: CLAUDE_PROJECT_DIR's (python #! line there), not the session's",
+     dict(argv=["./x.py"], session_cwd=pixi_x, CLAUDE_PROJECT_DIR=str(plain_x)), "deny"),
+    ("no cwd: CLAUDE_PROJECT_DIR's (pixi #! line there), not the session's",
+     dict(argv=["./x.py"], session_cwd=plain_x, CLAUDE_PROJECT_DIR=str(pixi_x)), "pass"),
+    ("no cwd, no CLAUDE_PROJECT_DIR: the session's (pixi #! line)", dict(argv=["./x.py"], session_cwd=pixi_x), "pass"),
+    ("no cwd, no CLAUDE_PROJECT_DIR: the session's (python #! line)", dict(argv=["./x.py"], session_cwd=plain_x), "deny"),
+    ("its cwd, not CLAUDE_PROJECT_DIR", dict(argv=["./x.py"], cwd=pixi_x, CLAUDE_PROJECT_DIR=str(plain_x)), "pass"),
+    # in a workspace with no cwd, the same: the gateway's MCP server fills in the cwd before the workspace
+    # applies (and the gateway refuses a cwd outside it)
+    ("a workspace, no cwd: CLAUDE_PROJECT_DIR's (pixi #! line there)",
+     dict(argv=["./x.py"], session_cwd=plain_x, CLAUDE_PROJECT_DIR=str(pixi_x), extra=WS), "pass"),
+    ("a workspace, no cwd: CLAUDE_PROJECT_DIR's (python #! line there)",
+     dict(argv=["./x.py"], session_cwd=pixi_x, CLAUDE_PROJECT_DIR=str(plain_x), extra=WS), "deny"),
+    ("a workspace, no cwd, no CLAUDE_PROJECT_DIR: the session's (pixi #! line)", dict(argv=["./x.py"], session_cwd=pixi_x, extra=WS), "pass"),
+    ("a workspace, no cwd, no CLAUDE_PROJECT_DIR: the session's (python #! line)", dict(argv=["./x.py"], session_cwd=plain_x, extra=WS), "deny"),
+    ("a workspace and a cwd: looked up there", dict(argv=["./x.py"], cwd=pixi_x, extra=WS), "pass"),
+    ("a workspace and a cwd, a python #! line there", dict(argv=["./x.py"], cwd=plain_x, session_cwd=pixi_x, extra=WS), "deny"),
+    ("a workspace, no cwd, a pixi #! script by its absolute path", dict(argv=[f"{pixi_x}/x.py"], extra=WS), "pass"),
+    ("a workspace, no cwd, a python #! script by its absolute path", dict(argv=[f"{plain_x}/x.py"], extra=WS), "deny"),
+    ("an empty workspace: as none", dict(argv=["./x.py"], session_cwd=pixi_x, extra={"workspace": ""}), "pass"),
+):
+    got = gwdecision(**kw)
+    check(f"{want:5} gateway job ./x.py, {label}", got == want, got)
+r = gwreason(argv=["./x.py"], session_cwd=pixi_x, CLAUDE_PROJECT_DIR=str(plain_x), extra=WS)
+check("gateway job in a workspace with no cwd, ./x.py with a python #! line: no folder note (its folder is known)",
+      "`x.py` would run Python outside pixi" in r and "not looked up" not in r and "`cwd`" not in r, r)
+check("pass  checkpoint job ./x.py with no cwd: the session's folder (CLAUDE_PROJECT_DIR is the gateway's default only)",
+      jdecision(argv=["./x.py"], session_cwd=pixi_x, CLAUDE_PROJECT_DIR=str(plain_x)) == "pass")
+r = gwreason(argv=["python", "train.py"], session_cwd=PLAIN, CLAUDE_PROJECT_DIR=str(jws))
+check("gateway job with no cwd: the advice is for CLAUDE_PROJECT_DIR's project", f"{jws} is a pixi workspace" in r, r)
+# Only tool_input's own keys count (the gateway reads b.get("host"), ...): a key in a nested object or in a
+# string is another one, and the first "host" in the text no longer turns the check off.
+for label, ti, want in (
+    ("a host in a nested object before the command", {"meta": {"host": "gpu1"}, "command": "python x.py"}, "deny"),
+    ("a key x\"host before the command", {'x"host': "gpu1", "command": "python x.py"}, "deny"),
+    ("a host in a nested list", {"meta": [{"host": "gpu1"}], "command": "python x.py"}, "deny"),
+    ("a command in a nested object before the command", {"meta": {"command": "ls"}, "command": "python x.py"}, "deny"),
+    ("a key x\"command before the command", {'x"command': "ls", "command": "python x.py"}, "deny"),
+    ("an argv in a nested object before the argv", {"meta": {"argv": ["ls"]}, "argv": ["python", "x.py"]}, "deny"),
+    ("a value that says \"host\": \"gpu1\"", {"note": 'say "host": "gpu1"', "command": "python x.py"}, "deny"),
+    ("the host after a nested object (a host of gateway.toml)", {"meta": {"host": "localhost"}, "host": "gpu1", "command": "python x.py"}, "pass"),
+    ("the host after the command (a host of gateway.toml)", {"command": "python x.py", "host": "gpu1"}, "pass"),
+    ("a nested command decoy, the command fine", {"meta": {"command": "python x.py"}, "command": "ls"}, "pass"),
+):
+    got = verdict(*run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": GWJOB, "tool_input": ti}))
+    check(f"{want:5} gateway job, {label}", got == want, got)
+GWRAW = '{"session_id":"s1","cwd":"%s","tool_name":"%s","tool_input":%s}'
+for label, ti, want in (
+    # Python's json (the gateway's) decodes keys: "\u0068ost" is host
+    ("a \\u-escaped host key (a host of gateway.toml)", '{"command":"python x.py","\\u0068ost":"gpu1"}', "pass"),
+    ("a \\u-escaped localhost", '{"command":"python x.py","host":"local\\u0068ost"}', "deny"),
+    ("a \\u-escaped command key", '{"\\u0063ommand":"python x.py"}', "deny"),
+    ("a nested tool_input with a command in it (its own command is ls)",
+     '{"tool_input":{"command":"python x.py"},"command":"ls"}', "pass"),
+):
+    got = verdict(*run("pre", None, raw=GWRAW % (PLAIN, GWJOB, ti)))
+    check(f"{want:5} gateway job, {label}", got == want, got)
+raw = '{"x":{"tool_input":{"command":"ls"}},"session_id":"s1","cwd":"%s","tool_name":"%s","tool_input":{"command":"python x.py"}}'
+check("deny  gateway job: the payload's own tool_input, not one nested before it", verdict(*run("pre", None, raw=raw % (PLAIN, GWJOB))) == "deny")
+raw = json.dumps({"session_id": "s1", "cwd": str(PLAIN), "tool_name": GWJOB,
+                  "tool_input": {"meta": {"host": "gpu1", "argv": ["ls"]}, "argv": ["python", "x.py"]}}, indent=2)
+check("deny  gateway job, pretty-printed JSON with decoys (lines between the keys)", verdict(*run("pre", None, raw=raw)) == "deny")
+r = gwreason(argv=["python", "train.py"], session_cwd=jws)
+check("gateway job refusal: the pixi way as the job's command, PIXI_GUARD=ask in front of it",
+      "make the job's command `pixi run python ...`" in r and "`PIXI_GUARD=ask` in front of its command" in r
+      and "PIXI_GUARD=ask <command>" not in r, r)
+r = gwreason(argv=["pip", "install", "torch"], cwd=jpy)
+check("gateway job refusal in a Python project not on pixi: the skill, then pixi add", "pixi-guard:project" in r and "Then manage packages with `pixi add" in r, r)
+check("gateway job: PIXI_GUARD=ask in front of the command asks", gwdecision(command="PIXI_GUARD=ask python train.py") == "ask")
+check("gateway job: PIXI_GUARD=ask as the first argv element asks", gwdecision(argv=["PIXI_GUARD=ask", "python", "train.py"]) == "ask")
+check("gateway job ask: names the job", "this job runs `python`" in gwreason(argv=["PIXI_GUARD=ask", "python", "x"]))
+for label, kw in (("neither command nor argv", {}), ("an empty argv", {"argv": []})):
+    out, err = gwjob(**kw)
+    check(f"gateway job with {label}: no output", out is None and not err, (out, err))
+r = subprocess.run([ph["command"], *[a.replace("${CLAUDE_PLUGIN_ROOT}", str(ROOT)) for a in ph["args"]]],
+                   input=json.dumps({"session_id": "s1", "cwd": str(PLAIN), "tool_name": GWJOB,
+                                     "tool_input": {"argv": ["pip", "install", "x"]}}),
+                   capture_output=True, text=True, env=env(True), cwd=str(TMP))
+check("gateway job_start through hooks.json as Claude Code runs it: deny", r.returncode == 0 and '"deny"' in r.stdout, r)
+
+print("the gateway's terminal_send: its text, read as typed into the gateway's bash")
+
+
+def gwsend(text=None, enter=None, keys=None, cwd=PLAIN, sid="s1", **kw):
+    ti = {"id": "t_01", "seq": 3}
+    if text is not None:
+        ti["text"] = text
+    if keys is not None:
+        ti["keys"] = keys
+    if enter is not None:
+        ti["enter"] = enter
+    return run("pre", {"session_id": sid, "transcript_path": "/x", "cwd": str(cwd),
+                       "hook_event_name": "PreToolUse", "tool_name": GWSEND, "tool_input": ti}, **kw)
+
+
+def sdecision(text, **kw):
+    return verdict(*gwsend(text, **kw))
+
+
+for text, want in (
+    ("pip install x\n", "deny"), ("python train.py\n", "deny"), ("ls\npython x\n", "deny"), ("cd sub && pytest -q\n", "deny"),
+    # typed without Enter: a later send (or keys) may press it
+    ("python train.py", "deny"), ("uv sync", "deny"), ("pixi run pip install x\n", "deny"),
+    ("gate with openai -- python train.py\n", "deny"),
+    ("pixi run python train.py\n", "pass"), ("ls -la\n", "pass"), ("git commit -m 'drop pip'\n", "pass"),
+    ("cd sub && pixi run pytest -q\n", "pass"), ("y\n", "pass"), ("q", "pass"), ("echo python\n", "pass"),
+    ("gate with openai -- pixi run python train.py\n", "pass"),
+):
+    got = sdecision(text)
+    check(f"{want:5} terminal text {text!r}", got == want, got)
+check("deny  terminal text with enter: true", sdecision("python x", enter=True) == "deny")
+check("pass  terminal text with keys after it", sdecision("ls", keys=["Enter"]) == "pass")
+for label, kw in (("keys only", {"keys": ["C-c"]}), ("an empty text", {"text": "", "enter": True})):
+    out, err = gwsend(**kw)
+    check(f"terminal send with {label}: no output", out is None and not err, (out, err))
+check("terminal: PIXI_GUARD=ask asks", sdecision("PIXI_GUARD=ask python x\n") == "ask")
+r = why(gwsend("PIXI_GUARD=ask python x\n")[0])
+check("terminal ask: names the terminal input", "this terminal input runs `python`" in r, r)
+r = why(gwsend("python x\n", cwd=jws)[0])
+check("terminal refusal: send it again with PIXI_GUARD=ask, run it with pixi run",
+      "send it again as `PIXI_GUARD=ask <command>`" in r and "pixi run python" in r and "job" not in r.replace(str(TMP), ""), r)
+check("deny  terminal, its bash 5.2, Claude Code's shell zsh", sdecision(b52_deny[0]) == "deny")
+r = why(gwsend(b52_deny[0])[0])
+check("terminal, bash 5.2: the note says the terminal runs the gateway's bash",
+      "the gateway's terminal runs its own bash, which is bash 5.2" in r, r)
+check("pass  terminal, Claude Code's shell bash 3.2 (not the terminal's)", sdecision(b32_deny[0], **B32) == "pass")
+# A terminal's folder is not known (it may have cd'd anywhere): a relative *.py path is not looked up there.
+check("pass  Bash ./x.py with a pixi #! line in the cwd", decision("./x.py", cwd=pixi_x) == "pass")
+check("deny  terminal ./x.py with a pixi #! line in the session's cwd", sdecision("./x.py\n", cwd=pixi_x) == "deny")
+r = why(gwsend("./x.py\n", cwd=pixi_x)[0])
+check("terminal ./x.py: the reason says to type its absolute path", "terminal's folder" in r and "absolute path" in r, r)
+check("pass  terminal: a pixi #! script by its absolute path", sdecision(f"{pixi_x}/x.py\n") == "pass")
+check("deny  terminal: a python #! script by its absolute path", sdecision(f"{plain_x}/x.py\n") == "deny")
+r = subprocess.run([ph["command"], *[a.replace("${CLAUDE_PLUGIN_ROOT}", str(ROOT)) for a in ph["args"]]],
+                   input=json.dumps({"session_id": "s1", "cwd": str(PLAIN), "tool_name": GWSEND,
+                                     "tool_input": {"id": "t_01", "seq": 1, "text": "pip install x\n"}}),
+                   capture_output=True, text=True, env=env(True), cwd=str(TMP))
+check("terminal_send through hooks.json as Claude Code runs it: deny", r.returncode == 0 and '"deny"' in r.stdout, r)
+for label, ti, want in (
+    ("a text in a nested object before the text", {"meta": {"text": "ls"}, "text": "pip install x\n"}, "deny"),
+    ("a key x\"text before the text", {'x"text': "ls", "text": "pip install x\n"}, "deny"),
+    ("a nested text decoy, the text fine", {"meta": {"text": "pip install x"}, "text": "ls\n"}, "pass"),
+):
+    got = verdict(*run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": GWSEND, "tool_input": {"id": "t_01", "seq": 1, **ti}}))
+    check(f"{want:5} terminal, {label}", got == want, got)
+# aliases: an interactive bash expands them, so the value is code (alias X=python, then X)
+for text, want in (("alias p=python\np x.py\n", "deny"), ("alias p=python; p x.py\n", "deny"), ("alias p='pip install'\n", "deny"),
+                   ("alias ll='ls -l'\nll\n", "pass"), ("alias p='pixi run python'\np x.py\n", "pass"), ("alias\n", "pass")):
+    got = sdecision(text)
+    check(f"{want:5} terminal text {text!r}", got == want, got)
+
 print("commands that run their arguments: parallel, hyperfine, numactl, entr, watchexec, nodemon, unbuffer, MCP inspector")
 expect("deny", [
     "parallel python run.py ::: 1 2 3", "parallel -j4 'pip install {}' ::: a b", "parallel --jobs 4 python {} ::: a.py",
@@ -1209,6 +1461,175 @@ expect("pass", [
     "npx @modelcontextprotocol/inspector pixi run python server.py", "npx @modelcontextprotocol/inspector node build/index.js",
     "npx -y create-react-app python-app",
 ])
+
+print("npm exec and npx: their command is a command (a package's bin, or with -p any program on PATH)")
+expect("deny", [
+    "npm exec -- python x.py", "npm exec -c 'pip list'", "npm exec --call='python x'", "npm x -- pytest -q",
+    "npm exec --package=foo -- python x.py", "npm exec -p foo -- pip install x", "npm exec -w app -- python x",
+    "npx -- python x.py", "npx python x.py", "npx -p foo -y -- uv run x.py", "bunx -- python x.py",
+    "npm exec -- sh -c 'python x'", "npm exec -- @modelcontextprotocol/inspector python s.py",
+])
+expect("pass", [
+    "npm exec -- prettier --write .", "npm exec -- pixi run python x.py", "npm exec --package=foo -- echo python",
+    "npm exec -w python -- tsc", "npm install python-shell", "npm run python", "npm exec", "npx -- tsc -p .",
+    "npx -p pip-licenses-js -- licenses", "npm x -- eslint .",
+])
+# npm's options before exec; pnpm and yarn exec / dlx, bun x: as npx
+expect("deny", [
+    "npm --yes exec -- python x", "npm -w app exec -- python x", "npm --prefix . exec -- python x", "npm -y x -- pytest -q",
+    "npm --workspace=app exec -- python x", "npm exec --prefix . -- python x", "npm --loglevel silent exec -- uv run x.py",
+    "pnpm exec python x.py", "pnpm dlx python x", "pnpm -C app exec pytest", "pnpm --filter app exec python x.py",
+    "pnpm exec -c 'pip list'", "pnpm exec --shell-mode 'pytest -q'", "pnpm dlx --package foo python x.py",
+    "yarn exec python x.py", "yarn dlx python x", "yarn --cwd app exec pytest", "yarn dlx -p foo python x.py",
+    "bun x python x", "bun x -- pytest -q", "bun --bun x python x.py",
+])
+expect("pass", [
+    "pnpm exec tsc", "pnpm dlx create-vite app", "pnpm install python-shell", "pnpm run python", "pnpm -C app exec tsc",
+    "yarn exec tsc", "yarn dlx create-vite app", "yarn add python-shell", "yarn python", "yarn --cwd app exec eslint .",
+    "bun x eslint .", "bun run python", "bun install pip", "npm --prefix exec install", "npm -w app run python",
+    "pnpm exec -- pixi run python x.py", "bun x pixi run pytest",
+    # after --, an option is the command (npm reads no options there): npx -- -c is not npx's -c
+    "npx -- -c 'pip list'", "npm exec -- -c 'pip list'",
+])
+
+print("pixi run / pixi exec of a package installer: refused (it changes the environment behind pixi.lock's back)")
+expect("deny", [
+    "pixi run pip install requests", "pixi run python -m pip install requests", "pixi run uv pip install foo", "pixi run uv add foo",
+    "pixi run pip3 install -e .", "pixi run python3.12 -m pip install -U x", "pixi run python -mpip install x",
+    "pixi run python -u -X dev -m pip install x", "pixi run pip --quiet install x", "pixi run uv --quiet add x",
+    "pixi run -e dev pip install x", "pixi run --environment dev -- pip install x", "pixi run -m /x/pixi.toml pip install x",
+    "pixi run --manifest-path=/x/pixi.toml --frozen pip install x", "pixi r pip install x", "pixi -v run pip install x",
+    "pixi --color never run pip install x", "pixi run 'pip install x'", "pixi run \"python -m pip install x && echo ok\"",
+    "pixi exec pip install x", "pixi x pip install x", "pixi exec --spec uv uv pip install x", "pixi exec -s pip -c conda-forge pip install x",
+    "/opt/local/bin/pixi run pip install x", "~/.pixi/bin/pixi run uv add x", "cd a && pixi run pip install x",
+    "bash -c 'pixi run uv add x'", "sudo pixi run pip install x", "timeout 60 pixi run pip install x",
+    "pixi run pypy3 -m pip install x",
+])
+expect("pass", [
+    "pixi run pip list", "pixi run pip show requests", "pixi run pip freeze", "pixi run pip download x", "pixi run pip-audit",
+    "pixi run python -m pip list", "pixi run python -m pipx install x", "pixi run python -c 'import pip'", "pixi run python -m pip",
+    "pixi run uv pip list", "pixi run uv lock", "pixi run uv --version", "pixi run pytest", "pixi run echo pip install x",
+    "pixi run -e pip python x.py", "pixi run --environment install pip list", "pixi run -x install", "pixi run install",
+    "pixi exec --spec pip pip list", "pixi exec -s install python x.py", "pixi add --pypi requests", "pixi add pip",
+    "pixi install", "pixi global install pip", "pixi run 'pip list && pytest'", "pixi run python x.py install",
+])
+# What pixi runs is read by the scanner in pixi mode: one word is a shell line to pixi (pixi 0.81 runs
+# `pixi run 'a && b'` as both, and `pixi run echo 'a; b'` as echo with one argument), wrappers and options
+# are skipped as anywhere, and only an installer is refused.
+expect("deny", [
+    # a shell line
+    "pixi run 'cd sub && pip install x'", "pixi run 'true; pip install x'", "pixi run 'FOO=1 pip install x'",
+    "pixi run 'ls | xargs pip install'", "pixi run 'echo hi\npip install x'", "pixi exec 'cd a && uv add x'",
+    "pixi run \"$(echo ok) && python -m pip install x\"", "pixi run 'if true; then uv pip install x; fi'",
+    # wrappers
+    "pixi run env PIP_X=1 pip install x", "pixi run -- env PIP_NO_CACHE=1 pip install x", "pixi run time pip install x",
+    "pixi run nice pip install x", "pixi run nice -n 5 python -m pip install x", "pixi run timeout 60 uv add x",
+    "pixi run command pip install x", "pixi run exec pip install x", "pixi run xargs pip install < reqs.txt",
+    # options that take a value, before the verb
+    "pixi run pip --cache-dir /c install x", "pixi run pip --log /tmp/l install x", "pixi run pip --log=/tmp/l install x",
+    "pixi run pip --python /x/python install x", "pixi run python -m pip --cache-dir /c install x",
+    "pixi run uv --directory . pip install x", "pixi run uv --project . add x", "pixi run uv --color never pip install x",
+    "pixi run uv --unknown-opt v add x", "pixi run pip --unknown-opt v install x",
+    # python's combined flags
+    "pixi run python -Im pip install x", "pixi run python -Bm pip install x", "pixi run python -Impip install x",
+    "pixi run python -W ignore -m pip install x", "pixi run python -Wignore -m pip install x",
+    "pixi run python -m pip.__main__ install x", "pixi run python -m uv pip install x", "pixi run python -m uv add x",
+    # brace expansion
+    "pixi run {pip,} install x", "pixi run {pip,pip3} install x", "pixi run {,python} -m pip install x",
+    # shells and more under pixi: what they run is under pixi too
+    "pixi run bash -c 'pip install x'", "pixi run sh -c 'cd a; uv add x'", "pixi exec -s pip bash -c 'pip install x'",
+    "pixi run bash <<'EOF'\npip install x\nEOF", "echo 'pip install x' | pixi run sh", "pixi run bash <<< 'uv add x'",
+    "cat <<'EOF' | pixi run bash\nuv pip install x\nEOF", "pixi run bash -c \"$(cat <<'EOF'\npip install x\nEOF\n)\"",
+    "pixi run find . -name '*.whl' -exec pip install {} +", "pixi run npx pip install x", "pixi run pixi run pip install x",
+    "pixi run eval 'pip install x'", "pixi run watchexec -- pip install -e .",
+    # redirections around the command
+    "pixi run > log pip install x", "pixi run 'pip install x' > log 2>&1",
+])
+expect("pass", [
+    "pixi run pytest", "pixi run python -m pytest", "pixi run python -m pip list", "pixi run pip list", "pixi run uv --version",
+    "pixi run 'cd sub && pytest -q'", "pixi run 'python -m pytest && python -m mypy .'", "pixi run 'FOO=1 python x.py'",
+    "pixi run env FOO=1 python x.py", "pixi run time python train.py", "pixi run nice -n 5 pytest", "pixi run python -c 'import pip'",
+    "pixi run python -Im pytest", "pixi run python -W ignore x.py install", "pixi run python -X dev -m pip show x",
+    "pixi run pip --log install.log list", "pixi run pip show install",
+    # (an option's value that is a command's name: a log file named install, a project folder named add)
+    "pixi run pip --log install list", "pixi run pip --cache-dir=install list", "pixi run uv --project add run x.py", "pixi run uv run add.py", "pixi run uv tool install ruff",
+    "pixi run uv pip compile r.in -o install.txt", "pixi run {pytest,} -q", "pixi run echo 'a; pip install x'",
+    "pixi run echo pip install x", "pixi run bash -c 'python x.py'", "pixi run bash -c 'pytest -q && mkdocs build'",
+    "pixi run bash <<'EOF'\npython x.py\nEOF", "echo 'python x.py' | pixi run sh", "cat <<'EOF' | pixi run bash\npytest\nEOF",
+    "pixi run bash -c \"$(cat <<'EOF'\npython x.py\nEOF\n)\"", "pixi run nodemon app.py", "pixi run npx python x.py",
+    "pixi run sudo -u bob python x.py", "pixi run 'source .venv/bin/activate'", "pixi run alias p=python",
+    "pixi run 'echo $(python -V)'", "pixi exec --spec rich -- python -m rich", "pixi run -- -m pip install x",
+])
+expect("deny", [
+    # the outer shell still runs what is outside pixi, and its $(...) before pixi does
+    "pixi run echo $(python x.py)", "pixi run pytest; python x.py", "pixi run bash -c 'ls' && pip install x",
+    "pixi run pytest | python x.py", "echo 'python x.py' | pixi run cat | sh",
+])
+# echo / printf words piped into a shell under pixi: an installer takes its verb, so what they print counts
+# (echo pip install x prints one line; printf's format with its arguments put in), not only each word
+expect("deny", [
+    "echo pip install x | pixi run bash", "echo uv add x | pixi run bash", "echo python -m pip install x | pixi run bash",
+    "printf '%s ' pip install x | pixi run sh", "echo pip \"install x\" | pixi run bash", "pixi run bash -c \"$(echo pip install x)\"",
+    "printf 'pip %s x\\n' install | pixi run sh", "printf '%s %s %s\\n' pip install x | pixi run sh",
+    "printf -- '%-5s %s\\n' pip install | pixi run sh", "echo -n uv pip install x | pixi exec bash",
+    "printf 'uv %s\\n' add x | pixi run bash", "pixi run echo pip install x | pixi run bash",
+])
+expect("pass", [
+    "echo pip list | pixi run bash", "echo python x.py | pixi run bash", "printf '%s\\n' pip install x | pixi run sh",
+    "printf '%s %s\\n' pip list | pixi run sh", "printf 'pip list %s\\n' install | pixi run sh", "printf '%%s %s\\n' install | pixi run sh",
+    "printf -v v '%s ' pip install x | pixi run sh", "echo pip install x | pixi run grep pip", "echo pytest -q | pixi run bash",
+])
+# (and outside pixi: printf 'py%s' thon prints python)
+expect("deny", ["printf 'py%s\\n' thon | bash", "printf '%s%s -V\\n' pyth on3 | sh", "printf '%c%s\\n' pip ython3 | sh"])
+# %c prints its argument's first character, and a * width takes an argument of its own (no word alone is python)
+expect("deny", ["printf '%c%s\\n' pz ython3 | sh", "printf '%*s%s -V\\n' 1 py thon3 | sh"])
+expect("pass", ["printf '%s ' ls -la | bash", "printf '%s\\n' ls pwd | sh", "printf 'py%s\\n' thon", "printf '%c%s\\n' xip ython3 | sh"])
+# What pixi run prints goes into the command's pipeline: fed to a shell outside pixi it is code there, as after
+# env, nice, ...; a shell under pixi that pipes into a shell has both under pixi.
+expect("deny", [
+    "pixi run echo python x.py | bash", "pixi run printf 'pip install x' | sh", "pixi run echo python x.py > >(bash)",
+    "pixi run tee >(bash) <<<'python x'", "pixi run -e dev echo pip list | sh", "pixi run env echo python x | bash",
+    "pixi run pixi run echo python x | bash", "echo python x.py | pixi run tee >(bash)", "pixi exec echo pytest | sh",
+    "tee >(bash) <<<'python x'", "env tee >(bash) <<<'python x'", "cat <<<'python x' > >(bash)", "bash <<<'python x' > >(bash)",
+])
+expect("pass", [
+    "pixi run echo python x.py | pixi run bash", "pixi run echo ls | bash", "pixi run echo python x.py | grep x",
+    "pixi run echo python x.py > >(cat)", "pixi run tee >(cat) <<<'python x'", "pixi run tee >(pixi run bash) <<<'python x'",
+    "pixi run bash -c \"echo 'python x.py' | bash\"", "pixi run bash -c 'cat <<EOF | bash\npython x.py\nEOF'",
+    "pixi run bash -c 'echo python x.py | sh'", "pixi exec bash -c \"$(echo python x.py)\"", "bash <<<'ls' > >(bash)",
+    # a >(bash) in code that runs under pixi is under pixi too (the mode of the code it is in, not the outer shell's)
+    "pixi run bash -c 'echo python x > >(bash)'", "pixi run bash -c \"tee >(bash) <<<'python x'\"",
+    "pixi run bash -c 'cat <<<\"python x\" > >(bash)'",
+])
+# A system package manager under pixi run still installs outside pixi's environment: refused as without it.
+expect("deny", ["pixi run brew install python", "pixi run apt-get install -y python3-pip", "pixi exec brew install uv"])
+expect("pass", ["pixi run brew install jq", "pixi run apt-get install -y pipewire", "pixi run brew info python"])
+# What runs under pixi sets no PATH and changes no folder for the rest of the command.
+expect("pass", ["pixi run 'cd /tmp && ls'; ./x.py", "pixi run cd /tmp; ./x.py"], "pixi #! line in the cwd: ", cwd=pixi_x)
+expect("deny", ["cd /tmp; ./x.py"], "pixi #! line in the cwd: ", cwd=pixi_x)
+check("pixi run pip install: PIXI_GUARD=ask still asks", decision("PIXI_GUARD=ask pixi run pip install x") == "ask")
+r = reason("PIXI_GUARD=ask pixi run uv add x")
+check("pixi run pip install, ask: says it installs behind pixi's back", "`pixi run uv add`" in r and "behind pixi's back" in r
+      and "outside pixi" not in r, r)
+pxws = TMP / "pxws"  # a pixi workspace
+pxws.mkdir()
+(pxws / "pixi.toml").write_text("[workspace]\n")
+r = reason("pixi run pip install -e .", cwd=pxws)
+check("pixi run pip install: the reason says why and gives pixi add (and the editable project)",
+      "`pixi run pip install` changes the pixi environment behind pixi.lock's back" in r and "`pixi add <pkg>`" in r
+      and "pixi add --pypi --editable" in r and "would run Python outside pixi" not in r and "run it as `pixi run" not in r, r)
+check("pixi run pip install: the override is for running it this way, not outside pixi",
+      "explicitly wants it run this way" in r and "PIXI_GUARD=ask <command>" in r, r)
+r = reason("pixi exec pip install rich", cwd=pxws)
+check("pixi exec pip install: the reason names the cached environment and pixi exec --spec",
+      "cached `pixi exec` environment" in r and "`pixi exec --spec <pkg> ...`" in r, r)
+r = reason("pixi run python -m pip install x", pixi=False, sid="pxm1")
+check("pixi run pip install without pixi found: no 'pixi not found' advice (it names pixi)", "not found" not in r
+      and "behind pixi.lock's back" in r, r)
+r = reason("pixi exec -s pip bash -c 'pip install x'", cwd=pxws)
+check("pixi exec bash -c 'pip install x': named as pixi exec's", "`pixi exec pip install`" in r and "cached `pixi exec` environment" in r, r)
+r = reason("pixi run 'cd sub && uv --project . add x'", cwd=pxws)
+check("pixi run shell line with uv add: the pixi add advice", "`pixi run uv add`" in r and "`pixi add <pkg>`" in r, r)
 
 print("Python console scripts by name")
 expect("deny", ["coverage run -m pytest", "coverage3 report", "coverage-3.12 html", "pip-audit", "pip-licenses", "pip-3.12 list",
@@ -1295,7 +1716,9 @@ expect("pass", ["mkdocs build", "mkdocs serve", "black --check .", "ipython -c '
                 "\"pytest\" -q", "${T:-pytest} -q", "~/.pixi/bin/mkdocs build", f"{gbin}/black --check .",
                 "$HOME/.pixi/bin/black .", "\"$HOME/.pixi/bin/black\" .", "${HOME}/.pixi/bin/mkdocs build",
                 "~/.pixi/envs/black/bin/black .", "PIXI_GUARD=ask mkdocs build", "nice -n 5 black .", "env FOO=1 black .",
-                "git commit -m \"$(cat <<'EOF'\nfix\nEOF\n)\" && pytest -q"], "pixi global: ", **G)
+                "git commit -m \"$(cat <<'EOF'\nfix\nEOF\n)\" && pytest -q",
+                # xcrun that runs no program (prints a path) leaves the PATH of the rest alone
+                "xcrun --show-sdk-path && pytest -q", "xcrun -f clang; mkdocs build"], "pixi global: ", **G)
 expect("pass", [" && ".join(f"t{k}" for k in range(1, 17))], "pixi global, 16 names: ", PIXI_GUARD_TOOLS="t[0-9]+", **G)
 expect("deny", [
     # installers and env managers: pixi add / pixi install instead, even from pixi global
@@ -1306,9 +1729,9 @@ expect("deny", [
     # PATH set in the command: where the name resolves is not known here
     "PATH=/usr/local/bin:$PATH mkdocs build", "export PATH=/opt/x:$PATH; pytest -q", "env PATH=/usr/local/bin pytest",
     "mkdocs build; PATH+=:/x", "sh -c 'PATH=/x pytest'", "typeset -x PATH=/x; pytest",
-    # sudo, su and env -i run it with another PATH
+    # sudo, su and env -i run it with another PATH; xcrun looks in Xcode first (xcrun python3 is Xcode's)
     "sudo -u bob black .", "sudo mkdocs build", "doas pytest", "env -i pytest", "env - pytest", "env -u PATH pytest",
-    "env --unset=PATH pytest", "su -c 'pytest' bob", "runuser -u bob -- pytest"], "pixi global: ", **G)
+    "env --unset=PATH pytest", "su -c 'pytest' bob", "runuser -u bob -- pytest", "xcrun python3 -V"], "pixi global: ", **G)
 expect("deny", [" && ".join(f"t{k}" for k in range(1, 18))], "pixi global, more than 16 names: ",
        PIXI_GUARD_TOOLS="t[0-9]+", **G)
 expect("pass", ["PYTHONPATH=src pytest -q", "MANPATH=x mkdocs build", "git commit -m 'set PATH=x' && black ."],
@@ -1359,10 +1782,46 @@ expect("deny", ["${PIXI_HOME:-/usr}/bin/pytest -q"], "PIXI_HOME not set: ", HOME
 expect("deny", ["pytest -q"], "an env without conda-meta/pixi: ", PATH=f"{notpixi / 'bin'}{os.pathsep}{BASE_PATH}")
 r = reason("PATH=/x:$PATH mkdocs build", **G)
 check("pixi global: the reason says PATH is set and offers the path", "PATH of its own" in r and "~/.pixi/bin/mkdocs" in r, r)
+r = reason("xcrun python3 -V", **G)
+check("pixi global: under xcrun the reason names it", "PATH of its own" in r and "xcrun" in r, r)
 check("pixi global: PIXI_GUARD=ask still asks for one elsewhere",
       decision("PIXI_GUARD=ask mkdocs build", HOME=str(gh), PATH=os.pathsep.join([str(other), BASE_PATH])) == "ask")
 check("a non-pixi copy first on PATH: the refusal names it",
       hit("mkdocs build", HOME=str(gh), PATH=os.pathsep.join([str(other), str(gbin), BASE_PATH])) == "mkdocs")
+
+print("the gateway's jobs and terminals: a bare name is looked up in the gateway's own PATH, not the hook's, so it is refused")
+# The gateway runs them with its folders, gateway.toml's import_path, then /usr/bin:/bin:/usr/sbin:/sbin.
+for cmd in ("python3 -V", "pytest -q", "mkdocs build", "env FOO=1 black ."):
+    check(f"pass  Bash {cmd!r}, pixi global first on the hook's PATH", decision(cmd, **G) == "pass")
+    got = gwdecision(command=cmd, **G)
+    check(f"deny  gateway job {cmd!r}, pixi global first on the hook's PATH", got == "deny", got)
+    got = sdecision(cmd + "\n", **G)
+    check(f"deny  gateway terminal {cmd!r}, pixi global first on the hook's PATH", got == "deny", got)
+for label, kw, want in (
+    ("argv, a bare name", dict(argv=["pytest", "-q"]), "deny"),
+    ("argv, pixi global's by its path", dict(argv=[f"{gbin}/pytest", "-q"]), "pass"),
+    ("~/.pixi/bin by its path", dict(command="~/.pixi/bin/python3 -V"), "pass"),
+    ("$HOME/.pixi/bin by its path", dict(command="$HOME/.pixi/bin/mkdocs build"), "pass"),
+    ("pixi run", dict(command="pixi run pytest -q"), "pass"),
+    ("pixi exec", dict(command="pixi exec black ."), "pass"),
+    ("on another host (not checked)", dict(command="pytest -q", host="gpu1"), "pass"),
+    ("a workspace env's by its path", dict(command=".pixi/envs/default/bin/pytest -q", cwd=pxproj), "pass"),
+):
+    got = gwdecision(**kw, **G)
+    check(f"{want:5} gateway job, pixi global first on the hook's PATH: {label}", got == want, got)
+check("deny  gateway job, inside pixi shell (its env first on the hook's PATH)", gwdecision(command="pytest -q", **PS) == "deny")
+check("pass  gateway terminal, ~/.pixi/bin by its path", sdecision("~/.pixi/bin/mkdocs build\n", **G) == "pass")
+r = gwreason(command="pytest -q", cwd=pxproj, **G)
+check("gateway job: the reason says the gateway runs it with a PATH of its own, offers pixi run and the path",
+      "The gateway runs the job with a PATH of its own" in r and "/usr/bin" in r and "~/.pixi/bin/pytest" in r
+      and "make the job's command `pixi run pytest ...`" in r and "it sets PATH" not in r, r)
+r = why(gwsend("pytest -q\n", cwd=pxproj, **G)[0])
+check("gateway terminal: the reason says the gateway's terminal runs it with a PATH of its own",
+      "The gateway's terminal runs it with a PATH of its own" in r and "run it as `pixi run pytest ...`" in r, r)
+check("Bash: no gateway PATH note", "gateway" not in reason("PATH=/x:$PATH mkdocs build", **G))
+# (what runs under pixi run sets no PATH for the rest of the command)
+expect("pass", ["pixi run env PATH=/x ls; mkdocs build", "pixi run 'PATH=/x ls' && black ."], "pixi global: ", **G)
+expect("deny", ["env PATH=/x ls; mkdocs build"], "pixi global: ", **G)
 
 print("a *.py script run by its path: let through if its #! line runs pixi")
 sb = TMP / "shebang"
@@ -1464,6 +1923,8 @@ budget_cmds = {
     "echo of 1-character words into sh": "echo " + "a " * 125000 + "| sh",
     "bash <(echo of 1-character words)": "bash <(echo " + "a " * 125000 + ")",
     "array errors on every line": "bash -c '" + "a=(;)\n" * 10000 + "'",
+    # (it would print 50000 copies of a 100KB format)
+    "printf of a long format, used again for each argument, into sh": "printf '" + "a" * 100000 + "%s\\n' " + "x " * 50000 + "| sh",
     "brace expansion in every command": "{a,b}{c,d}{e,f}{g,h} x; " * 9000,
 }
 for label, cmd in budget_cmds.items():
@@ -1493,7 +1954,8 @@ for label, cmd in (
 print("raw control characters stay linear (each \\x01 was a new record, re-copying the text)")
 for label, cmd, want in (
     ("300K \\u0001 then python3", "\x01" * 300000 + "\npython3 x", "too large"),
-    ("240K \\u0001 then python3", "\x01" * 240000 + "\npython3 x", "`python3`"),
+    # (150K: JSON writes each as \u0001, and a payload over 1MB is not read)
+    ("150K \\u0001 then python3", "\x01" * 150000 + "\npython3 x", "`python3`"),
     ("1MB of \\u0001\\u0002", "\x01\x02" * 500000 + "\npython3 x", "too large"),
 ):
     r, cpu, _ = budgeted(reason, cmd)
@@ -1502,15 +1964,16 @@ raw = '{"session_id":"s1","cwd":"%s","tool_input":{"command":"%s\\npython3 x"}}'
 (out, _), cpu, _ = budgeted(run, "pre", None, raw=raw)
 check(f"300K raw \\x01 bytes in the JSON: refused, {cpu:.2f}s CPU",
       (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") == "deny" and cpu < CPU, out)
-out, _ = pre("echo " + "\x01" * 200000 + "a" * 70000 + "; PIXI_GUARD=ask python3 x")
+out, _ = pre("echo " + "\x01" * 120000 + "a" * 150000 + "; PIXI_GUARD=ask python3 x")
 check("over 256KB: PIXI_GUARD=ask after a \\x01 record still asks",
       (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") == "ask", out)
-# Over 1.6MB of JSON string only that much is decoded (more than 256KB, so "too large"): an
-# ask at the start still asks; one past that point is cut off, and the command is refused.
-for cmd, want in (("PIXI_GUARD=ask echo " + "\x01" * 300000 + "; python3 x", "ask"),
-                  ("echo " + "\x01" * 300000 + "; PIXI_GUARD=ask python3 x", "deny")):
+# A payload over 1MB is not read (see pre; 1.8MB here, a 300KB command): refused as too large to read, and a
+# PIXI_GUARD=ask anywhere in it asks (as anywhere in a command over 256KB).
+for label, cmd, want in (("PIXI_GUARD=ask first", "PIXI_GUARD=ask echo " + "\x01" * 300000 + "; python3 x", "ask"),
+                         ("PIXI_GUARD=ask last", "echo " + "\x01" * 300000 + "; PIXI_GUARD=ask python3 x", "ask"),
+                         ("PIXI_GUARD=asking", "echo " + "\x01" * 300000 + "; PIXI_GUARD=asking python3 x", "deny")):
     (out, _), cpu, _ = budgeted(pre, cmd)
-    check(f"1.8MB of JSON, PIXI_GUARD=ask {'first' if want == 'ask' else 'last'}: {want}, {cpu:.2f}s CPU",
+    check(f"1.8MB of JSON, {label}: {want}, {cpu:.2f}s CPU",
           (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") == want and cpu < CPU, out)
 out, _ = pre("echo " + "a" * 300000 + "\x01PIXI_GUARD=ask python3 x")
 check("over 256KB: \\x01 right before PIXI_GUARD=ask is not a separator (refused)",
@@ -1540,8 +2003,11 @@ print("watchdog: a scan still running after PIXI_GUARD_WATCHDOG seconds is refus
 REAL_AWK = shutil.which("awk")
 FAKE_AWKS = {}
 for name, scan_does in (
-        # the scan (awk -v tools=...) spins, for 30 s at most; other awk calls run as usual
-        ("slow", "exec '%s' 'BEGIN { srand(); t = srand(); for (;;) { srand(); if (srand() - t > 30) exit } }'" % REAL_AWK),
+        # the scan (awk -v tools=...) spins, for 30 s at most; other awk calls run as usual. (srand()
+        # returns the previous seed, the time of day: in seconds under gawk, BWK awk and busybox, in
+        # nanoseconds under mawk 1.3.4 20250131, Debian 13's awk; u scales it to seconds.)
+        ("slow", "exec '%s' 'BEGIN { srand(); t = srand(); for (u = 1; t / u >= 1e10; u *= 1000) ; "
+                 "for (;;) { srand(); if ((srand() - t) / u > 30) exit } }'" % REAL_AWK),
         ("failing", "exit 2")):
     d = TMP / f"{name}-awk"
     d.mkdir()
@@ -1634,7 +2100,7 @@ py_proj = TMP / "pyproj"
 (py_proj / "pkg").mkdir(parents=True)
 (py_proj / "pyproject.toml").write_text("[project]\nname='a'\n")
 r = reason("python x", cwd=py_proj / "pkg")
-check("non-pixi python project", "not on pixi" in r and "pixi:project" in r and str(py_proj) in r, r)
+check("non-pixi python project", "not on pixi" in r and "pixi-guard:project" in r and str(py_proj) in r, r)
 wrap = r.split("put the wrapper at ")[1].split(" ")[0].rstrip(".")
 check("wrapper path is under the wrap dir", wrap.startswith(str(TMP / "wrap")) and wrap.endswith("/pixi.toml"), wrap)
 check("wrapper dir keeps its historic name (name_-cksum)", re.search(r"/pyproj_-\d+/pixi\.toml$", wrap), wrap)
@@ -1778,11 +2244,15 @@ r = subprocess.run(["sh", str(PIXI_SH), "--version"], capture_output=True, text=
 check("pixi.sh without pixi: exit 127 and a pointer to pixi.sh", r.returncode == 127 and "https://pixi.sh" in r.stderr, r)
 
 print("session start")
-out, _ = session()
+# pixi on PATH too: BASE_PATH drops ~/.pixi/bin, where pixi's installer puts it, and with PIXI_GUARD_PIXI's
+# pixi not on PATH the context says it "may not be on PATH" (checked with the "found off PATH" ones above).
+out, _ = session(PATH=f"{FAKE_PIXI.parent}{os.pathsep}{BASE_PATH}")
 ctx = out["hookSpecificOutput"]["additionalContext"]
-check("policy context", "pixi" in ctx and "pixi:project" in ctx and "Monitor" in ctx and "terminal" in ctx)
+check("policy context", "pixi" in ctx and "pixi-guard:project" in ctx and "Monitor" in ctx and "terminal" in ctx)
 check("policy context: checkpoint's job_start, with the pixi way for a job's command",
       "job_start" in ctx and "`pixi run python train.py`" in ctx, ctx)
+check("policy context: the gateway's job_start and terminal_send, and no pixi run pip install",
+      "the gateway's job_start and terminal_send" in ctx and "`pixi run pip install`" in ctx, ctx)
 check("no missing notice when pixi exists", "not found" not in ctx and "systemMessage" not in out)
 out, _ = session(pixi=False)
 check("missing pixi: context says so", "not found" in out["hookSpecificOutput"]["additionalContext"])
@@ -1792,7 +2262,7 @@ print("skill")
 skill = (ROOT / "skills" / "project" / "SKILL.md").read_text()
 check("skill finds the hook via ${CLAUDE_PLUGIN_ROOT}", "${CLAUDE_PLUGIN_ROOT}/hooks/guard.sh" in skill)
 check("skill never restores files with git checkout --", "checkout --" not in skill)
-check("skill warns that a worktree's exclude rules are shared by every checkout", "every checkout" in skill and "git add -f" in skill)
+check("skill warns that the exclude rules are shared by every worktree of the clone", "every worktree" in skill and "git add -f" in skill)
 snippet = re.search(r"In a git checkout.*?```bash\n(.*?)```", skill, re.S).group(1)
 if shutil.which("git"):
     fake = TMP / "skillbin"
@@ -1832,12 +2302,24 @@ print("version")
 pj = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
 ver = pj["version"]
 check("plugin.json version is semver", re.fullmatch(r"\d+\.\d+\.\d+", ver), ver)
+check("plugin.json links its source (homepage, repository)",
+      pj.get("homepage") == pj.get("repository") == "https://github.com/p-w-rs/pixi-guard", pj)
 mk = json.loads((REPO / ".claude-plugin" / "marketplace.json").read_text())
 entry = [p for p in mk["plugins"] if p["name"] == pj["name"]]
 check("marketplace lists the plugin by its name", len(entry) == 1, entry)
 check("marketplace entry has no conflicting version", entry and entry[0].get("version", ver) == ver)
 md = re.search(r"plugin name `[^`]+`, v(\d+\.\d+\.\d+)", (REPO / "CLAUDE.md").read_text())
 check("CLAUDE.md states the plugin.json version", md and md.group(1) == ver, md and md.group(1))
+# The plugin is pixi-guard (install id pixi-guard@pixi-guard, skill pixi-guard:project); it was pixi up to 0.2.0.
+check("plugin.json name is pixi-guard, and so is the marketplace's", pj["name"] == "pixi-guard" == mk["name"], (pj["name"], mk["name"]))
+md = re.search(r"plugin name `([^`]+)`", (REPO / "CLAUDE.md").read_text())
+check("CLAUDE.md states the plugin.json name", md and md.group(1) == pj["name"], md and md.group(1))
+refs = re.findall(r"skill ([A-Za-z0-9_-]+):project", GUARD.read_text())
+check("guard.sh names the skill as <plugin name>:project", len(refs) >= 2 and set(refs) == {pj["name"]}, refs)
+check("the skill's folder is skills/project", (ROOT / "skills" / "project" / "SKILL.md").exists())
+readme = (REPO / "README.md").read_text()
+check("README installs it by its id", f"/plugin install {pj['name']}@{mk['name']}" in readme, pj["name"])
+check("README names the skill by its id", f"{pj['name']}:project" in readme and "`pixi:project`" not in readme)
 check("no top-level bin/ in the plugin", not (ROOT / "bin").exists())
 
 print("robustness")
@@ -1848,6 +2330,31 @@ out, _ = run("pre", None, raw='{"session_id":"s1","tool_input":{"command":"echo 
 check("escaped quotes and \\u escapes decode", out and out["hookSpecificOutput"]["permissionDecision"] == "deny", out)
 out, _ = run("pre", None, raw='{"tool_input":{"description":"say \\"command\\": \\"python\\"","command":"ls"}}')
 check("a quoted \"command\" inside another value is not the command", out is None, out)
+out, _ = run("pre", None, raw='{"tool_input":{"meta":{"command":"ls"},"command":"python x"}}')
+check("a \"command\" in a nested object is not the command (tool_input's own is)", verdict(out, "") == "deny", out)
+raw = '{"tool_input":{"command":"python x.py"},"later":{"host":"gpu1"},"tool_name":"mcp__plugin_gate_gw__job_start"}'
+check("a host in an object after tool_input is not tool_input's (a local gateway job: deny)", verdict(*run("pre", None, raw=raw)) == "deny")
+out, _ = run("pre", None, raw='{"tool_name":"Bash","tool_input":{"description":"d"},"later":{"command":"pip install x"}}')
+check("a command in an object after tool_input is not tool_input's (none: no output)", out is None, out)
+out, _ = run("pre", None, raw='{"tool_input":{"note":"a \\\\","command":"python x"}}')
+check("a value ending in an escaped backslash ends there", verdict(out, "") == "deny", out)
+out, _ = run("pre", None, raw='{"tool_input":{"note":"a \\\\\\" \\"command\\":\\"python x","command":"ls"}}')
+check("an escaped quote after an escaped backslash stays in the string", out is None, out)
+# More than 64 backslashes before a quote: counted without a loop over each (see oddtail)
+for nb, want in ((100, "pass"), (101, "deny"), (4, "pass"), (3, "deny")):
+    note = "x" + "\\" * nb + ('"' if nb % 2 == 0 else "") + ' "command": "python x'
+    # (an even count of escaped backslashes and an escaped quote: the fake "command" stays in the string;
+    # an odd count of escaped backslashes and no quote: the note ends there, and ' "command"...' is no key)
+    ti = {"note": note, "command": "ls"} if nb % 2 == 0 else {"note": "x" + "\\" * nb, "command": "python x"}
+    got = verdict(*run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": "Bash", "tool_input": ti}))
+    check(f"{want:5} a value with {nb} escaped backslashes{' and an escaped quote' if nb % 2 == 0 else ''} before the command",
+          got == want, got)
+out, _ = run("pre", None, raw='{"session_id":"s1","tool_input":{"command":"python x"},"tool_name":"mcp__plugin_gate_gw__job_start"}')
+check("the tool name after tool_input is still read (top level): a job's refusal", "the job's command" in why(out), out)
+for label, ti in (("an argv in a nested object", {"meta": {"argv": ["ls"]}, "argv": ["python", "x.py"]}),
+                  ("a command in a nested object", {"meta": {"command": "ls"}, "argv": ["python", "x.py"]})):
+    got = verdict(*run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": JOB, "tool_input": ti}))
+    check(f"deny  checkpoint job, {label} before its own", got == "deny", got)
 r = reason('python "a\\b"', cwd=PLAIN)
 check("reason is valid JSON with quotes/backslashes", "pixi-guard" in r)
 out, err = run("pre", {"tool_name": "Bash"})
@@ -1892,6 +2399,21 @@ for label, cmd, want in (
     ("one glob word of !(...) groups", "ls " + "!(*.py)" * 34000 + "; ls", "pass"),
     ("glob words of groups", "ls " + "*(.)@(a) " * 26000 + "; python3 x", "deny"),
     # a "((" or "$((" whose "))" never comes is not looked for again after it
+    # pixi run / exec: each looked at once, a long first word only to its first KB
+    ("pixi run commands", "pixi run -e dev pip list; " * 9000 + "python3 x", "deny"),
+    ("one long pixi run word", "pixi run '" + "pip list " * 26000 + "' && python3 x", "deny"),
+    ("one long pixi run word without blanks", "pixi run " + "a" * 240000 + " && python3 x", "deny"),
+    ("npx commands", "npx a b; " * 25000 + "python3 x", "deny"),
+    # pixi run shell lines and their wrappers: each read once more, in pixi mode
+    ("pixi run shell lines", "pixi run 'cd a && pip list'; " * 8000 + "python3 x", "deny"),
+    ("pixi run wrappers and options", "pixi run env A=1 nice pip --log l list; " * 6000 + "python3 x", "deny"),
+    ("pixi run python flags", "pixi run python -Im -Wignore x.py; " * 6500 + "python3 x", "deny"),
+    ("pnpm exec commands", "pnpm -C a exec tsc; " * 11000 + "python3 x", "deny"),
+    # echo / printf words into a shell: each word, and what echo prints (once more); printf '%s\n' prints the
+    # words themselves, one a line (not read again)
+    ("echo of 30000 words into sh", "echo " + "ab " * 30000 + "| sh", "pass"),
+    ("printf '%s\\n' of 30000 words into sh", "printf '%s\\n' " + "ab " * 30000 + "| sh", "pass"),
+    ("printf '%s ' of 30000 words into pixi run sh", "printf '%s ' " + "ab " * 30000 + "| pixi run sh", "pass"),
     ("unbalanced (", "(" * 200000 + "ls", "pass"),
     ("(( with no ))", "(( " * 80000 + "\npython3 x", "deny"),
 ):
@@ -1900,6 +2422,65 @@ for label, cmd, want in (
     got = "deny" if r else "pass"
     check(f"{label} ({len(cmd) // 1000}KB): {want}, {cpu:.2f}s CPU, {wall:.2f}s",
           got == want and "too large" not in r and len(cmd) < 262144 and cpu < CPU, (got, r[:80]))
+# tool_input's own keys are found by one walk over the JSON (see jindex), however many quotes come before them
+big = 'echo "' + 'a\\"b ' * 48000 + '" && python x'
+decoy = {"meta": {"x": ['a"b\\'] * 30000, "host": "localhost"}}
+for label, kw, want in (("its host after it", dict(host="gpu1"), "pass"), ("no host", {}, "deny"),
+                        ("a nested decoy full of quotes first, then its host", dict(host="gpu1", extra=decoy), "pass"),
+                        ("a nested decoy full of quotes first, no host", dict(extra=decoy), "deny")):
+    (out, err), cpu, wall = budgeted(gwjob, command=big, **kw)
+    got = verdict(out, err)
+    check(f"gateway job, a {len(big) // 1000}KB command of escaped quotes, {label}: {want}, {cpu:.2f}s CPU, {wall:.2f}s",
+          got == want and "too large" not in why(out) and cpu < CPU, (got, why(out)[:80]))
+# Over 500,000 quotes, or a long stretch with brackets between two strings, the payload is refused unread
+# (before the scan's watchdog starts, the walk must stay short); under that, it is read in well under a second.
+for label, ti, want, big in (
+    ("480K quotes in a decoy, then a host", {"meta": ['"'] * 160000, "command": "python x", "host": "gpu1"}, "pass", False),
+    ("480K quotes in a decoy, no host", {"meta": ['"'] * 160000, "command": "python x"}, "deny", False),
+    ("600K quotes in a decoy, then a host", {"meta": ['"'] * 200000, "command": "ls", "host": "gpu1"}, "deny", True),
+    ("600K quotes, PIXI_GUARD=ask", {"meta": ['"'] * 200000, "command": "PIXI_GUARD=ask ls"}, "ask", True),
+    ("600K quotes, PIXI_GUARD=ask as the first argv element", {"meta": ['"'] * 200000, "argv": ["PIXI_GUARD=ask", "ls"]}, "ask", True),
+    ("600K quotes, PIXI_GUARD=asking", {"meta": ['"'] * 200000, "command": "PIXI_GUARD=asking ls"}, "deny", True),
+    ("300K escaped backslashes (600K characters) before the command", {"note": "\\" * 300000, "command": "python x"}, "deny", False),
+    ("1MB of blanks between two keys", {"command": "python x", "note": "x"}, "deny", False),
+    ("5000 nested lists before the command", {"meta": "NEST", "command": "ls"}, "deny", True),
+    ("1000 nested lists before the command", {"meta": "NEST4", "command": "ls"}, "pass", False),
+):
+    data = json.dumps({"session_id": "s1", "cwd": str(PLAIN), "tool_name": GWJOB, "tool_input": ti})
+    data = data.replace('"NEST"', "[" * 5000 + "]" * 5000).replace('"NEST4"', "[" * 1000 + "]" * 1000)
+    if label.startswith("1MB"):
+        data = data.replace('"note"', " " * 1000000 + '"note"')
+    (out, err), cpu, wall = budgeted(run, "pre", None, raw=data)
+    got, r = verdict(out, err), why(out)
+    check(f"gateway job, {label} ({len(data) // 1000}KB): {want}{' (too large to read)' if big else ''}, {cpu:.2f}s CPU",
+          got == want and (("too large" in r) == big or want == "pass") and cpu < CPU, (got, r[:100]))
+
+# Under the quote budget's 500,000 quotes in less than 1MB: still refused unread.
+data = '{"session_id":"s1","cwd":%s,"tool_name":"%s","tool_input":{"meta":[%s],"command":"ls","host":"gpu1"}}' % (
+    json.dumps(str(PLAIN)), GWJOB, ",".join(['""'] * 260000))
+(out, err), cpu, wall = budgeted(run, "pre", None, raw=data)
+check(f"gateway job, 520K quotes in {len(data) // 1000}KB: deny (too large to read), {cpu:.2f}s CPU",
+      verdict(out, err) == "deny" and "too large" in why(out) and cpu < CPU, why(out)[:100])
+# The walk's time grows with the payload's size (about 0.9 s per MB at worst under gawk, before the scan's 7 s
+# watchdog starts): a payload over 1MB is not read at all, whatever is in it; up to 1MB, the worst shapes are
+# read well within the budget. (16MB of bracket-heavy values took 13 s under gawk: a hook timeout.)
+BR = '[' * 2000 + '"x"' + ']' * 2000 + ','
+for label, ti, want, big in (
+    ("1.1MB of description, then an ordinary command", '{"description":"%s","command":"ls"}' % ("a" * 1100000), "deny", True),
+    ("1.1MB of description, PIXI_GUARD=ask", '{"description":"%s","command":"PIXI_GUARD=ask ls"}' % ("a" * 1100000), "ask", True),
+    ("1.1MB of description, PIXI_GUARD=\"ask\"", '{"description":"%s","command":"PIXI_GUARD=\\"ask\\" ls"}' % ("a" * 1100000), "ask", True),
+    ("1.1MB of description, a host of gateway.toml", '{"description":"%s","command":"ls","host":"gpu1"}' % ("a" * 1100000), "deny", True),
+    ("16MB of bracket-heavy values", '{"a":[%s0],"command":"ls"}' % (BR * 4000), "deny", True),
+    ("1MB of bracket-heavy values, then python", '{"a":[%s0],"command":"python x"}' % (BR * 260), "deny", False),
+    ("1MB of escaped keys with [] values, then python", '{%s"command":"python x"}' % "".join('"\\\\%x":[],' % k for k in range(84000)), "deny", False),
+    ("1MB of escaped backslashes, then python", '{"note":"%s","command":"python x"}' % ("\\\\" * 520000), "deny", False),
+):
+    data = '{"session_id":"s1","cwd":%s,"tool_name":"%s","tool_input":%s}' % (json.dumps(str(PLAIN)), GWJOB, ti)
+    (out, err), cpu, wall = budgeted(run, "pre", None, raw=data)
+    got, r = verdict(out, err), why(out)
+    check(f"gateway job, {label} ({len(data) // 1000}KB): {want}{' (too large to read)' if big else ''}, {cpu:.2f}s CPU",
+          got == want and ("too large" in r) == big and (big or "`python` would run" in r) and (len(data) > 1048576) == big
+          and cpu < CPU, (got, len(data), r[:100]))
 
 print(f"\n{PASS} passed, {FAIL} failed")
 shutil.rmtree(TMP, ignore_errors=True)

@@ -5,8 +5,10 @@
 #   session    SessionStart: print the Python-via-pixi policy as additionalContext,
 #              and tell the user when pixi can't be found.
 #   pre        PreToolUse (Bash, Monitor, the desktop app's terminal tool,
-#              checkpoint's job_start): refuse
-#              a command that runs Python or Python tooling outside pixi, with a
+#              checkpoint's job_start, the gateway's job_start and
+#              terminal_send): refuse
+#              a command that runs Python or Python tooling outside pixi (or a
+#              package installer in a pixi environment: pixi run pip install), with a
 #              reason that tells Claude what to do instead. `PIXI_GUARD=ask
 #              <command>` turns the refusal into a permission prompt, so running
 #              it outside pixi needs the user's yes. A command too big or nested
@@ -58,27 +60,125 @@ RJOIN='
 ASKREC='
 	function askrec(r) { return index(r, "PIXI_GUARD=") && (NR > 1 ? "\001" r : r) ~ /(^|[;&|( \t\n])PIXI_GUARD=("ask"|\047ask\047|ask)[ \t]/ }'
 
-# Decoded value of the first "key": "string" in the payload (with $2, the
-# first after "$2": {, as in `field cwd tool_input`). Linear time: one match()
-# isolates the value, one split() at its backslashes decodes it.
+# The payload's keys the hook reads, and where their values start: "NAME
+# OFFSET" items joined by ";", NAME tool_name, cwd or session_id for the
+# payload's top level, tool_input.KEY for tool_input's (KEY command, argv,
+# text, host or cwd). Only there: a "key" in a nested object, or in
+# a string ({"meta": {"host": ...}}, "x\"host"), is another key, which the
+# tools ignore. Keys compare decoded; the first one counts (Claude Code's JSON
+# has no duplicate keys). One walk, run once (field() and argvcmd() look the
+# offsets up), in linear time: split() at the quotes; in a string, a part that
+# ends in an odd number of backslashes ends at an escaped quote; outside, a
+# part that starts with ":" makes the string before it a key, at the depth
+# the brackets before it give. Over 500,000 quotes (a command over 256KB is
+# refused unread anyway), or 4KB between two strings with a bracket in it
+# (Claude Code's tool inputs have neither), it prints "cut": the payload is
+# refused as too large to read. Its time still grows with the payload's size
+# (up to about 0.9 s per MB under gawk, half that in BWK awk), and it runs
+# before the scan's watchdog starts: a payload over 1MB is not walked at all
+# (see pre).
+jindex() {
+	printf '%s' "$input" | awk '
+	BEGIN { RS = "\001"; split("command argv text host cwd", kt, " "); for (k in kt) TK[kt[k]] = 1 }
+	{ R[NR] = $0 }
+	END {
+		text = rjoin()
+		# (a one-character separator also splits at newlines in BWK awk)
+		n = index(text, "\n") ? split(text, P, /"/) : split(text, P, "\"")
+		if (n > 500000) { printf "cut"; exit }
+		# off: where P[k] starts; d: the depth; ins: P[k] is in a string, which
+		# started at P[ks] (at depth sd); ti: 1 in tool_input, 2 after it
+		off = 1; d = ins = ti = lstr = 0
+		for (k = 1; k <= n; k++) {
+			x = P[k]
+			if (ins) {
+				m = length(x); off += m + 1
+				if (substr(x, m) != "\\" || !oddtail(x)) { ins = 0; lstr = 1; lk = ks; le = k; ld = sd }
+				continue
+			}
+			if (lstr && (ld == 1 || (ld == 2 && ti == 1)) && match(x, /^[ \t\r\n]*:[ \t\r\n]*/)) {
+				key = jkey(lk, le); v = off + RLENGTH
+				if (ld == 1) {
+					if ((key == "tool_name" || key == "cwd" || key == "session_id") && !(key in JI)) JI[key] = v
+					else if (key == "tool_input" && !ti && substr(x, RLENGTH + 1, 1) == "{") ti = 1
+				}
+				else if ((key in TK) && !(("tool_input." key) in JI)) JI["tool_input." key] = v
+			}
+			lstr = 0
+			if (index(x, "{") || index(x, "}") || index(x, "[") || index(x, "]")) {
+				# (gsub() is quadratic in its matches in BWK awk)
+				if (length(x) > 4096) { printf "cut"; exit }
+				y = x; d += gsub(/[{]/, "", y) + gsub(/[[]/, "", y) - gsub(/[}]/, "", y) - gsub(/[]]/, "", y)
+				if (ti == 1 && d < 2) ti = 2
+			}
+			ins = 1; ks = k + 1; sd = d
+			off += length(x) + 1
+		}
+		# (one line: BWK awk takes no newline in a -v value)
+		for (k in JI) { printf "%s%s %s", sep, k, JI[k]; sep = ";" }
+	}
+	# Does x (which ends in a backslash) end in an odd number of them? Its last
+	# 64 characters, else a binary search (substr() walks the whole string in
+	# BWK awk: no loop over every character).
+	function oddtail(x,    n, y, m, c, lo, hi, mid) {
+		n = length(x); y = n > 64 ? substr(x, n - 63) : x; m = length(y)
+		for (c = 0; c < m && substr(y, m - c, 1) == "\\"; c++) ;
+		if (c < m || n <= 64) return c % 2
+		# the first of the backslashes at the end: in lo..hi
+		lo = 1; hi = n - 63
+		while (lo < hi) { mid = int((lo + hi) / 2); if (substr(x, mid) ~ /^\\+$/) hi = mid; else lo = mid + 1 }
+		return (n - lo + 1) % 2
+	}
+	# Key P[a..b] (joined at the escaped quotes between them), decoded; "" if
+	# over 256 characters (no key looked for is that long).
+	function jkey(a, b,    s, k, n, c, r, v, h, j) {
+		s = P[a]; n = length(s)
+		for (k = a + 1; k <= b; k++) { n += length(P[k]) + 1; if (n > 256) return ""; s = s "\"" P[k] }
+		if (n > 256) return ""
+		if (!index(s, "\\")) return s
+		r = ""; h = "0123456789abcdef"
+		for (k = 1; k <= n; k++) {
+			c = substr(s, k, 1)
+			if (c == "\\" && k < n) {
+				c = substr(s, ++k, 1)
+				if (c == "u") { v = 0; for (j = 1; j <= 4; j++) v = v * 16 + index(h, tolower(substr(s, k + j, 1))) - 1; k += 4; c = (v > 0 && v < 128) ? sprintf("%c", v) : "?" }
+				else if (c == "n") c = "\n"
+				else if (c == "t") c = "\t"
+				else if (c == "r") c = "\r"
+				else if (c == "b" || c == "f") c = " "
+			}
+			r = r c
+		}
+		return r
+	}'"$RJOIN"
+}
+# awk: jat(name) is the offset of that value (see jindex, in $jix), or 0.
+JAT='
+	function jat(name,    n, k, L, F) {
+		n = split(jix, L, ";")
+		for (k = 1; k <= n; k++) if (split(L[k], F, " ") == 2 && F[1] == name) return F[2] + 0
+		return 0
+	}'
+
+# Decoded value of "key": "string" at the payload's top level (with $2, at the
+# top level of the object "$2": {...}, as in `field cwd tool_input`); see
+# jindex, which must have listed it. Linear time: one match() isolates the
+# value, one split() at its backslashes decodes it.
 field() {
-	printf '%s' "$input" | awk -v key="$1" -v obj="${2:-}" '
+	printf '%s' "$input" | awk -v key="${2:+$2.}$1" -v jix="$jix" '
 	BEGIN { RS = "\001" }
 	# Records are kept and joined once (appending each to the text would take
 	# quadratic time when the input is full of \001 characters).
 	{ R[NR] = $0 }
 	END {
 		text = rjoin()
-		if (obj != "") {
-			if (!match(text, "\"" obj "\"[ \t\r\n]*:[ \t\r\n]*[{]")) exit
-			text = substr(text, RSTART + RLENGTH)
-		}
-		if (!match(text, "\"" key "\"[ \t\r\n]*:[ \t\r\n]*\"")) exit
-		rest = substr(text, RSTART + RLENGTH)
+		if (!(off = jat(key)) || substr(text, off, 1) != "\"") exit
+		rest = substr(text, off + 1)
 		if (!match(rest, /^([^"\\]|\\.)*"/)) exit
 		s = substr(rest, 1, RLENGTH - 1)
 		# Over 6 x 256KB (an escape is at most 6 bytes) it decodes to more than
-		# the 256KB scan() reads anyway: decode only that much.
+		# the 256KB scan() reads anyway: decode only that much. (A backstop: pre
+		# reads no payload over 1MB.)
 		if (RLENGTH > 1600000) s = substr(s, 1, 1600000)
 		# A one-character separator is fast, but BWK awk also splits at newlines
 		# with it; valid JSON has none in a string, else take the slow regex.
@@ -104,10 +204,10 @@ field() {
 		printf "%s", o3 o2 o1
 	}
 	function add(x) { o1 = o1 x; if (++n1 >= 64) { o2 = o2 o1; o1 = ""; n1 = 0; if (++n2 >= 64) { o3 = o3 o2; o2 = ""; n2 = 0 } } }
-	'"$RJOIN"
+	'"$RJOIN$JAT"
 }
 
-# The payload's first "argv": [ "string", ... ] (checkpoint's job_start) as
+# tool_input's "argv": [ "string", ... ] (a job_start's; see jindex) as
 # the command line /bin/sh gets: checkpoint runs `/bin/sh -c
 # "$(shlex.join(argv))"`, so each element becomes one word, quoted as
 # Python's shlex.quote does it (bare if made of A-Za-z0-9_@%+=:,./- only, so
@@ -117,15 +217,16 @@ field() {
 # JSON, as field()) is read character by character once, and words grow
 # through small buffers. It stops once the line is over 256KB, which scan()
 # refuses as too large, and a list cut at 1.6MB before its "]" is padded
-# past that size too (nothing after the cut is read).
+# past that size too (nothing after the cut is read; a backstop: pre reads no
+# payload over 1MB).
 argvcmd() {
-	printf '%s' "$input" | awk '
+	printf '%s' "$input" | awk -v jix="$jix" '
 	BEGIN { RS = "\001" }
 	{ R[NR] = $0 }
 	END {
 		text = rjoin()
-		if (!match(text, /"argv"[ \t\r\n]*:[ \t\r\n]*\[/)) exit
-		rest = substr(text, RSTART + RLENGTH)
+		if (!(off = jat("tool_input.argv")) || substr(text, off, 1) != "[") exit
+		rest = substr(text, off + 1)
 		cut = (length(rest) > 1600000)
 		if (cut) rest = substr(rest, 1, 1600000)
 		if (split("ab", t, "") == 2) n = split(rest, c, "")
@@ -170,7 +271,7 @@ argvcmd() {
 		if (cut && !done && tot <= LIM) printf "%" (LIM - tot + 1) "s", ""
 	}
 	function add(x) { o1 = o1 x; if (++n1 >= 64) { o2 = o2 o1; o1 = ""; n1 = 0; if (++n2 >= 64) { o3 = o3 o2; o2 = ""; n2 = 0 } } }
-	'"$RJOIN"
+	'"$RJOIN$JAT"
 }
 
 # JSON string literal of $1. No gsub() replacement strings (backslashes in them
@@ -272,9 +373,16 @@ wrap_manifest() {
 # (which would let it through). It runs in the background: $! is its awk (see
 # watched_scan).
 scan() {
-	printf '%s' "$1" | awk -v tools="${PIXI_GUARD_TOOLS:-}" -v b32="${b32:-0}" -v b52="${b52:-0}" -v vb="${vb:-0}" '
+	printf '%s' "$1" | awk -v tools="${PIXI_GUARD_TOOLS:-}" -v b32="${b32:-0}" -v b52="${b52:-0}" -v vb="${vb:-0}" -v tcd="${tcd:-0}" -v gwp="${gwp:-0}" '
 	BEGIN {
 		RS = "\001"
+		# TCD: the command runs in a folder not known here (a gateway
+		# terminal'"'"'s), so a relative *.py path is not looked up (as after cd).
+		CDX = (tcd == 1)
+		# GWP: the gateway runs it with a PATH of its own (its folders, then
+		# /usr/bin:/bin...), not the one bare names are looked up in here, as
+		# if it set PATH (see deftool).
+		PATHSET = (gwp == 1)
 		# (pip-NAME, or pip-VERSION: not pip-check-deps.sh)
 		if (tools == "") tools = "python|python[0-9][0-9.]*|pythonw|pypy|pypy[0-9][0-9.]*|pip|pip[0-9][0-9.]*|pipx|pip-[a-z0-9-]+|pip-[0-9][0-9.]*|uv|uvx|easy_install|easy_install-[0-9.]+|conda|mamba|micromamba|poetry|pipenv|pyenv|virtualenv|hatch|pdm|rye|flit|twine|tox|nox|ipython|ipython[0-9]|jupyter|jupyter-[a-z-]+|jupytext|pytest|py\\.test|coverage|coverage-?[0-9][0-9.]*|mypy|black|isort|flake8|pylint|uvicorn|gunicorn|flask|django-admin|streamlit|alembic|celery|torchrun|accelerate|deepspeed|sphinx-build|mkdocs"
 		toolre = "^(" tools ")$"
@@ -310,7 +418,7 @@ scan() {
 		# Wrappers that run the rest of the line as a command. OS = letters of
 		# their short options that take an argument, OL = long options (and odd
 		# single-dash ones) that take a separate argument.
-		split("command exec builtin env time nohup sudo doas xargs nice ionice timeout gtimeout caffeinate stdbuf arch busybox setsid flock lockf strace ltrace xvfb-run taskset chrt script sandbox-exec screen numactl unbuffer entr", t, " ")
+		split("command exec builtin env time nohup sudo doas xargs nice ionice timeout gtimeout caffeinate stdbuf arch busybox setsid flock lockf strace ltrace xvfb-run taskset chrt script sandbox-exec screen numactl unbuffer entr xcrun", t, " ")
 		for (k in t) WR[t[k]] = 1
 		OS["exec"] = "a"; OS["env"] = "uCSPLU"; OS["time"] = "fo"; OS["sudo"] = "aCcDgpRrTtUu"; OS["doas"] = "uCa"
 		OS["xargs"] = "IdELnPsaJRS"; OS["nice"] = "n"; OS["ionice"] = "cnpPu"; OS["timeout"] = "sk"; OS["gtimeout"] = "sk"
@@ -333,6 +441,23 @@ scan() {
 		OL["numactl"] = " --interleave --preferred --membind --cpunodebind --physcpubind --preferred-many --weighted-interleave "
 		OL["parallel"] = " --arg-file --colsep --delimiter --jobs --max-procs --profile --max-args --max-replace-args --sshlogin --sshloginfile --slf --max-chars --workdir --wd --joblog --results --res --tmpdir --timeout --delay --retries --halt --load --memfree --nice --tagstring --tag-string --header --env --basefile --bf --return --transferfile --tf --arg-sep --arg-file-sep --block --block-size --recstart --recend --rpl --ssh --sshdelay --termseq --limit --group-by --semaphore-timeout --semaphorename --id --filter "
 		OL["watchexec"] = " --watch --watch-non-recursive --watch-file --on-busy-update --signal --stop-signal --stop-timeout --map-signal --debounce --delay-run --shell --emit-events-to --env --wrap-process --color --project-origin --workdir --exts --filter --filter-file --filter-prog --ignore --ignore-file --fs-events --completions "
+		OL["xcrun"] = " -sdk --sdk -toolchain --toolchain "
+		# pixi run and pixi exec (see pixi()): their options that take a value.
+		OS["pixi run"] = "epmws"; OS["pixi exec"] = "swcp"
+		# pip and uv under pixi (see pipargs, uvargs): their commands (uv pip'"'"'s:
+		# UVPC), and options that take a value (PIPV, UVV); npm, pnpm, yarn and
+		# bun (see npmexec, npx): options that take a value (NPV).
+		split("install download uninstall freeze inspect list show check config search cache index wheel hash completion debug help lock", t, " ")
+		for (k in t) PIPC[t[k]] = 1
+		split("run init add remove version sync lock export tree format tool python pip venv build publish cache self auth help generate-shell-completion", t, " ")
+		for (k in t) UVC[t[k]] = 1
+		split("compile sync install uninstall freeze list show tree check", t, " ")
+		for (k in t) UVPC[t[k]] = 1
+		PIPV = " --python --log --log-file --local-log --keyring-provider --proxy --retries --timeout --exists-action --trusted-host --cert --client-cert --cache-dir --src --use-feature --use-deprecated --resume-retries "
+		UVV = " --directory --project --config-file --cache-dir --color --python-preference --allow-insecure-host --python -p "
+		NPV = " -p --package -w --workspace --prefix -C --dir --filter -F --registry --cache --userconfig --globalconfig --loglevel --location --cwd --node-options --resume-from --workspace-concurrency --reporter --modules-folder --cache-folder --global-folder --network-timeout "
+		OL["pixi run"] = " --environment --platform --manifest-path --workspace --script --config-file --auth-file --concurrent-downloads --concurrent-solves --pinning-strategy --pypi-keyring-provider --tls-root-certs --color "
+		OL["pixi exec"] = " --spec --with --channel --platform --auth-file --concurrent-downloads --concurrent-solves --pinning-strategy --pypi-keyring-provider --tls-root-certs --color "
 		# Options whose value is shell code (script -c CMD).
 		CO["script"] = " -c --command "
 		# Words between the options and the command: timeout DURATION, flock
@@ -359,6 +484,11 @@ scan() {
 		# Printable ASCII, for {a..e} brace ranges.
 		ASC = ""; for (k = 32; k < 127; k++) ASC = ASC sprintf("%c", k)
 		hit = ""; ask = 0; nsq = 0
+		# printf: the flags, widths and precisions of a directive (see pfmt).
+		PFL = "-+ #0123456789.*\047"
+		# ECKD: the depth of check() whose echo / printf prints into the
+		# command'"'"'s pipeline (1; deeper for what pixi run runs, see pixi()).
+		ECKD = 1
 		# hit is set to CX when a budget runs out: that stops every loop.
 		CX = "\001complex"
 	}
@@ -381,13 +511,18 @@ scan() {
 			if (si == 1) { PBMAX = 4 * n + 100000; PWMAX = n + 400000 }
 			PW += 8
 			tot += n; WKMAX = 8 * tot + 200000
-			nr = VIEW = 0; rpush(1, n)
+			nr = VIEW = 0; PXM = SQM[si]; rpush(1, n)
 			for (ri = 1; ri <= nr && hit == ""; ri++) {
 				if ((PW += RHI[ri] - RLO[ri] + 1) > PWMAX) toomuch()
-				else { VIEW = RV[ri]; FEED = RF[ri]; CSUB = RC[ri]; parse(RLO[ri], RHI[ri]) }
+				else {
+					VIEW = RV[ri]; FEED = RF[ri]; CSUB = RC[ri]; PXM = PXR = RM[ri]
+					# (what runs under pixi sets no PATH, nor a folder, for the rest)
+					if (PXM == "") parse(RLO[ri], RHI[ri])
+					else { PXS = PATHSET; PXC = CDX; parse(RLO[ri], RHI[ri]); PATHSET = PXS; CDX = PXC }
+				}
 			}
 		}
-		VIEW = 0
+		VIEW = 0; PXM = ""
 		# A *.py script by a relative path in a command that may change folders
 		# (cd, env -C, ...) is not looked up: it is refused.
 		if (hit == "" && CDX) for (k = 1; k <= NPY; k++) if (PYP[k] !~ /^(\/|~\/)/) { x = PYP[k]; sub(/.*\//, "", x); found(x); PYCD = 1; break }
@@ -426,20 +561,30 @@ scan() {
 		return n
 	}
 	function toomuch() { if (hit == "") hit = CX }
+	# Queue string s to be parsed, as code that runs the way the current code
+	# does (SQM: under pixi run or pixi exec, see PXM).
 	function push(s) {
 		if ((PB += length(s) + 1) > PBMAX) toomuch()
-		else SQ[++nsq] = s
+		else { SQ[++nsq] = s; SQM[nsq] = PXM }
 	}
-	# Queue ch[a..b] to be parsed (in the current view). Returns 1 if it did.
+	# Queue ch[a..b] to be parsed (in the current view and pixi mode, RM).
+	# Returns 1 if it did.
 	# RC: it is (in) the body of a $(...), <(...) or >(...), where bash 5.2
 	# ends heredocs its own way (view 4, see body_end); the caller sets it.
 	function rpush(a, b) {
 		if (a > b) return 0
 		if (nr >= 200000) { toomuch(); return 0 }
-		nr++; RLO[nr] = a; RHI[nr] = b; RV[nr] = VIEW; RF[nr] = RC[nr] = 0
+		nr++; RLO[nr] = a; RHI[nr] = b; RV[nr] = VIEW; RF[nr] = RC[nr] = 0; RM[nr] = PXM
 		return 1
 	}
 	function spent(n) { if ((WK += n) > WKMAX) toomuch() }
+	# PXM: "" for code the shell runs, "run" or "exec" for code that pixi run
+	# or pixi exec runs in a pixi environment (where only package installers
+	# are refused, see pixi()). As a number (for CMDSH, PSH, RF): 1, 2, 3.
+	# PXR: the mode of the range being parsed (in pixi(), PXM is pixi run'"'"'s).
+	function mcode() { return PXM == "" ? 1 : PXM == "run" ? 2 : 3 }
+	function rcode() { return PXR == "" ? 1 : PXR == "run" ? 2 : 3 }
+	function mname(c) { return c == 2 ? "run" : c == 3 ? "exec" : "" }
 	function nx(k) { return k <= HI ? ch[k] : "" }
 
 	# The word being built: w, wm, wb are buffers (so a long word costs linear
@@ -501,18 +646,21 @@ scan() {
 	function opword(x) { endword(); nw++; WD[nw] = x; PRE[nw] = ""; OP[nw] = 1; PR[nw] = DX[nw] = 0; cpos(0) }
 	function lit(a, b) { for (; a <= b; a++) wadd(ch[a]) }
 	# End the simple command being built and check it. CMDSH: is it a shell
-	# reading stdin; PIPE: its pipeline. p is 1 at a pipe (the next command is
-	# in the same pipeline), 2 at a "(" "{" ")" "}" (a group is a stage of the
-	# pipeline it is in), else 0. pp: the last one was a pipe. gd: open groups.
+	# reading stdin, or does it print into one (>(bash), PSUB): 0, else that
+	# shell'"'"'s mode (see check); PIPE: its pipeline. p is 1 at a
+	# pipe (the next command is in the same pipeline), 2 at a "(" "{" ")" "}" (a
+	# group is a stage of the pipeline it is in), else 0. pp: the last one was a
+	# pipe. gd: open groups.
 	function endcmd(p,    r) {
 		if (wn || wq) endword()
-		ncmd++; ECHOI = 0
+		ncmd++; ECHOI = PSUB = 0
 		r = nw ? check(1, nw) : 0
 		CMDSH[ncmd] = r; PIPE[ncmd] = curpipe
 		# echo / printf (or a command reading a here-string: cat <<< "pip list")
 		# whose output may reach a shell: keep its words for flush().
-		# (r: echo x > >(bash), see check1)
-		if (p == 1 || gd || FEED || r) { if (ECHOI) echoargs(ECHOI); else if (HSN && !r) hsargs() }
+		# (r: echo x > >(bash), tee >(bash) <<< x, see check1; a shell reading
+		# stdin takes its here-string as code itself, see stdin)
+		if (p == 1 || gd || FEED || r) { if (ECHOI) echoargs(ECHOI); else if (HSN && (!r || PSUB)) hsargs() }
 		HSN = 0
 		# A group followed by a pipe: (cat <<EOF; ls) | bash.
 		if (GL) { if (p == 1) relabel(GL, curpipe); GL = 0 }
@@ -1157,21 +1305,30 @@ scan() {
 		if (nb == 1 || c < IMIN) IMIN = c
 	}
 	# Fed to a shell (directly, or by a later stage of the pipeline: cat <<EOF
-	# | bash, echo "pip list" | sh) it is code; otherwise only an unquoted body
-	# is looked at, for the $(...) and `...` it expands.
-	function flush(    k, h, c) {
-		# PSH[k]: command k or a later stage of its pipeline is a shell reading stdin.
-		# In a range whose output is code (feed()), every command'"'"'s is.
-		for (k = ncmd; k >= IMIN; k--) PSH[k] = FEED || CMDSH[k] || (k < ncmd && PIPE[k + 1] == PIPE[k] && PSH[k + 1])
+	# | bash, echo "pip list" | sh) it is code, run the way that shell runs
+	# (pixi run bash reads it under pixi); otherwise only an unquoted body is
+	# looked at, for the $(...) and `...` it expands.
+	function flush(    k, h, c, pm) {
+		# PSH[k]: command k or a later stage of its pipeline is a shell reading
+		# stdin (its mode, see mcode). In a range whose output is code (feed()),
+		# every command'"'"'s is.
+		for (k = ncmd; k >= IMIN; k--) PSH[k] = FEED ? FEED : CMDSH[k] ? CMDSH[k] : (k < ncmd && PIPE[k + 1] == PIPE[k]) ? PSH[k + 1] : 0
+		pm = PXM
 		for (h = 1; h <= nb; h++) {
-			c = IC[h] <= ncmd && PSH[IC[h]]
+			c = IC[h] <= ncmd ? PSH[IC[h]] : 0
+			if (c) PXM = mname(c)
 			if (IT[h] == "e") { if (c) for (k = IA[h]; k <= IB[h]; k++) pushw(EA[k]) }
 			else if (c) rpush(IA[h], IB[h])
 			else if (IT[h] == "h") substscan(IA[h], IB[h])
+			PXM = pm
 		}
 		nb = NEA = 0
 	}
-	# The words echo / printf at WD[i] prints (printf -v prints nothing).
+	# The words echo / printf at WD[i] prints (printf -v prints nothing),
+	# each one, and then (for more than one) the text it prints: echo'"'"'s words
+	# joined by blanks, printf'"'"'s format with its arguments put in (see pfmt).
+	# Under pixi only an installer is refused, and it takes its verb: echo pip
+	# install x | pixi run bash.
 	function echoargs(i,    j, x, b, lo) {
 		b = WD[i]; sub(/.*\//, "", b); lo = NEA + 1
 		for (j = i + 1; j <= nw; j++) {
@@ -1184,7 +1341,52 @@ scan() {
 			}
 			EA[++NEA] = x
 		}
+		if (NEA > lo) { x = b == "printf" ? pfmt(lo, NEA) : ejoin(lo, NEA); if (hit == "" && x != "") EA[++NEA] = x }
 		if (NEA >= lo) defer(ncmd, lo, NEA, "e")
+	}
+	# EA[a..b] joined by blanks.
+	function ejoin(a, b,    o1, o2, o3, n1, n2) {
+		spent(b - a + 1)
+		o1 = EA[a]; o2 = o3 = ""; n1 = n2 = 0
+		for (a++; a <= b; a++) {
+			o1 = o1 " " EA[a]
+			if (++n1 >= 64) { o2 = o2 o1; o1 = ""; n1 = 0; if (++n2 >= 64) { o3 = o3 o2; o2 = ""; n2 = 0 } }
+		}
+		return o3 o2 o1
+	}
+	# What printf FORMAT ARGS... prints, roughly: FORMAT is EA[a], ARGS
+	# EA[a+1..b]. Each % directive takes the next argument (and each * in it
+	# one more; %c its first character, %% is a %), and FORMAT is used again
+	# while arguments are left. Its escapes are left for pushw(), which
+	# decodes them. "" when that adds nothing to the words: FORMAT takes no
+	# argument (it is printed once), or it is %s\n (each argument on a line).
+	# The work (the text it makes) is counted (spent) before it is done.
+	function pfmt(a, b,    n, k, c, p, d, s, o1, o2, o3, n1, n2) {
+		if (EA[a] == "%s\\n") return ""
+		# d: its directives, found as below (a pass takes at least d arguments)
+		n = chars(EA[a], PF); d = s = 0
+		for (k = 1; k < n; k++) if (PF[k] == "%" && PF[++k] != "%") { for (; k < n && index(PFL, PF[k]); k++) ; d++ }
+		if (!d) return ""
+		for (k = a + 1; k <= b; k++) s += length(EA[k])
+		spent(int((b - a + d - 1) / d) * n + s)
+		if (hit != "") return ""
+		o1 = o2 = o3 = ""; n1 = n2 = 0; p = a + 1
+		do {
+			for (k = 1; k <= n; k++) {
+				c = PF[k]
+				if (c == "%" && k < n) {
+					if (PF[++k] == "%") c = "%"
+					else {
+						for (; k < n && index(PFL, PF[k]); k++) if (PF[k] == "*") p++
+						c = p <= b ? EA[p++] : ""
+						if (PF[k] == "c") c = substr(c, 1, 1)
+					}
+				}
+				o1 = o1 c
+				if (++n1 >= 64) { o2 = o2 o1; o1 = ""; n1 = 0; if (++n2 >= 64) { o3 = o3 o2; o2 = ""; n2 = 0 } }
+			}
+		} while (p <= b)
+		return o3 o2 o1
 	}
 	# The here-strings of the command.
 	function hsargs(    j, lo) {
@@ -1253,14 +1455,16 @@ scan() {
 	# -I / -i / -J, SCX to the command of screen -X, ESH for entr -s, PQ for
 	# parallel -q, CDX for an option that changes folders (env -C, ...), and
 	# NOEX where nothing is run (sudo -e / -l, taskset -p, chrt -p, script
-	# -p). Each option word is split into characters once (BWK awk'"'"'s substr()
-	# walks the whole word).
+	# -p, xcrun -f). Each option word is split into characters once (BWK
+	# awk'"'"'s substr() walks the whole word).
 	function skipopts(b, i, i1,    x, sl, ll, k, m, c) {
 		sl = OS[b]; ll = OL[b]
 		while (i <= i1 && !OP[i] && WD[i] ~ /^-/) {
 			x = WD[i]
 			if (x == "--") return i + 1
 			if (index(ll, " " x " ")) { optv(b, x, i < i1 ? WD[i + 1] : ""); i += 2; continue }
+			# (xcrun'"'"'s options are words: -find, -show-sdk-path, -log)
+			if (b == "xcrun") { if (x == "-f" || x == "-find" || x == "--find") NOEX = 1; i++; continue }
 			if (x ~ /^--/) {
 				if (k = index(x, "=")) optv(b, substr(x, 1, k - 1), substr(x, k + 1))
 				else if ((b == "sudo" && (x == "--edit" || x == "--list")) || ((b == "taskset" || b == "chrt") && x == "--pid")) NOEX = 1
@@ -1576,19 +1780,23 @@ scan() {
 		for (BGN = 0; s > 0 ? a <= b : a >= b; a += s) BG[++BGN] = k ? substr(ASC, a, 1) : a
 		return 1
 	}
-	# Look at one simple command, WD[i0..i1]. Returns 1 if it is a shell reading
-	# its script from stdin (so a heredoc body fed to it is code). It recurses
-	# for find -exec, su, ...: deeper than 10 is "complex".
+	# Look at one simple command, WD[i0..i1]. Returns 0, or the mode (see
+	# mcode) of the shell that runs what goes into its stdin as code: it is a
+	# shell reading its script from stdin (so a heredoc body fed to it is
+	# code; pixi run bash: 2), or what it prints goes into a >(bash) (run in
+	# the mode of the code that has it, rcode; PSUB). It recurses for find
+	# -exec, su, ...: deeper than 10 is "complex".
 	function check(i0, i1,    r, d) {
 		if (++CKD > 10) { toomuch(); CKD--; return 0 }
 		if (CKD == 1) wredir(i0, i1)
-		# DSH: a reading of a ${NAME:-WORD} program word was a shell reading stdin.
+		# DSH: a reading of a ${NAME:-WORD} program word was a shell reading
+		# stdin (its mode).
 		d = DSH; DSH = 0
-		r = check1(i0, i1) || DSH
+		r = check1(i0, i1); if (!r && DSH) r = DSH
 		DSH = d; CKD--
 		return r
 	}
-	function check1(i0, i1,    i, x, b, j, k, rb, y, z, xa, xr) {
+	function check1(i0, i1,    i, x, b, j, k, rb, y, z, xa, xr, rr) {
 		ENVS = ""; NOEX = 0; xa = 0
 		i = i0
 		while (i <= i1) {
@@ -1605,8 +1813,10 @@ scan() {
 				i = (j <= i1 && WD[j] == "--") ? j + 1 : j
 				continue
 			}
-			# direnv exec DIR CMD, asdf exec CMD, mise exec [TOOL...] -- CMD (or -c CMD)
+			# direnv exec DIR CMD, asdf exec CMD, mise exec [TOOL...] -- CMD (or -c CMD),
+			# gate with NAME -- CMD (the gateway runs CMD with an account'"'"'s key)
 			if (b == "direnv" && i < i1 && WD[i + 1] == "exec") { i += 3; continue }
+			if (b == "gate" && i + 3 <= i1 && WD[i + 1] == "with" && WD[i + 3] == "--") { i += 4; continue }
 			if (b == "asdf" && i < i1 && WD[i + 1] == "exec") { i += 2; continue }
 			if ((b == "mise" || b == "rtx") && i < i1 && (WD[i + 1] == "exec" || WD[i + 1] == "x")) {
 				for (j = i + 2; j <= i1 && WD[j] != "--"; j++) {
@@ -1618,13 +1828,16 @@ scan() {
 			if (b in WR) {
 				XR = SCX = ""; ESH = 0
 				# sudo, doas, env -i, env -u PATH: the program is looked up in
-				# another PATH (see deftool)
+				# another PATH (see deftool); xcrun looks in Xcode first
+				# (xcrun python3 is Xcode'"'"'s)
 				if (b == "sudo" || b == "doas") PATHSET = 1
 				else if (b == "env") for (j = i + 1; j <= i1 && !OP[j] && WD[j] ~ /^-/; j++)
 					if (WD[j] == "-" || WD[j] ~ /^-[A-Za-z]*i/ || WD[j] == "--ignore-environment" || WD[j] ~ /^(-[A-Za-z]*u|--unset=)PATH$/ ||
 					    (WD[j] ~ /^(-[A-Za-z]*u|--unset)$/ && j < i1 && WD[j + 1] == "PATH")) PATHSET = 1
 				i = skipopts(b, i + 1, i1)
 				if (NOEX) return 0
+				# xcrun with a program left (not -f or --show-sdk-path alone)
+				if (b == "xcrun" && i <= i1 && !OP[i]) PATHSET = 1
 				# entr -s CMD: CMD is shell code.
 				if (ESH) { if (i <= i1 && !OP[i]) code(i); return 0 }
 				if (b == "xargs") { xa = 1; xr = XR }
@@ -1647,11 +1860,11 @@ scan() {
 			# or := with a value, is never empty: then the program is its default or
 			# a value not known here (${EDITOR:-vim} f.py), and that is all.
 			if (PDW != "") {
-				spent(i1 - i + 1); k = PDN
+				spent(i1 - i + 1); rr = PDN
 				y = WD[i]; z = PRE[i]; WD[i] = PRE[i] = PDW
-				if (check(i, i1)) DSH = 1
+				if ((k = check(i, i1))) DSH = k
 				WD[i] = y; PRE[i] = z
-				if (hit != "" || (k && x == "")) return 0
+				if (hit != "" || (rr && x == "")) return 0
 			}
 			# Brace expansion: {python,pip} x runs python, the first word it makes
 			# ({,python3} x too: an empty word is dropped). Every word it makes is
@@ -1663,7 +1876,8 @@ scan() {
 				for (k = 1; k <= NBX; k++) {
 					y = BX[k]; if (k == 1 || x == "") x = y
 					b = y; if (index(b, "/")) sub(/.*\//, "", b)
-					if (istool(b, y, WD[i])) { found(b); return 0 }
+					if (PXM) { if (pxinst(b, i, i1)) return 0 }
+					else if (istool(b, y, WD[i])) { found(b); return 0 }
 				}
 			}
 			if (x != "") break
@@ -1673,33 +1887,45 @@ scan() {
 			if (i > i1) return 0
 		}
 		b = x; if (index(b, "/")) sub(/.*\//, "", b)
-		if (b == "pixi") return 0
+		if (b == "pixi") return pixi(i, i1)
 		if (b in WRT) wargs(b, i + 1, i1)
 		# export PATH=... (and zsh'"'"'s path=(...) array, tied to it): see deftool
 		if (b ~ /^(export|declare|typeset|local|readonly)$/) for (j = i + 1; j <= i1; j++) if (WD[j] ~ /^PATH\+?=/ || WD[j] ~ /^path\+?=\(\)$/) PATHSET = 1
 		# (a relative *.py path is then not looked up, see END)
 		if (b == "cd" || b == "pushd" || b == "popd") CDX = 1
 		# echo '"'"'pip list'"'"' | tee >(bash), echo '"'"'pip list'"'"' > >(bash): what goes into a
-		# >(...) that starts with a shell reading stdin is code.
+		# >(...) that starts with a shell reading stdin is code, for that shell:
+		# the one of this code, also after pixi run (pixi run echo x > >(bash)).
 		for (j = i + 1; j <= i1; j++)
 			if (WD[j] == ">()" && PR[j] && (b == "tee" || (OP[j - 1] && WD[j - 1] ~ /^&?>[>|]?$/)) && shin(PR[j])) {
-				if ((b == "echo" || b == "printf") && CKD == 1) ECHOI = i
-				return 1
+				if ((b == "echo" || b == "printf") && CKD == ECKD) ECHOI = i
+				PSUB = 1; return rcode()
 			}
-		if ((b == "echo" || b == "printf") && CKD == 1) { ECHOI = i; return 0 }
+		if ((b == "echo" || b == "printf") && CKD == ECKD) { ECHOI = i; return 0 }
 		if (b in SHELL) {
 			if (!shell(i, i1, b, xa, xr)) return 0
 			stdin(i0, i1)
-			return 1
+			return mcode()
 		}
 		if (b == "eval") { push(join(i + 1, i1, 0)); for (j = i + 1; j <= i1; j++) if (WD[j] == "$()") feed(j); return 0 }
+		# alias NAME=VALUE...: VALUE runs where NAME is typed as a command (in an
+		# interactive shell, such as a gateway terminal; zsh: alias -s py=python
+		# runs x.py with python), so it is code.
+		if (b == "alias") {
+			for (j = i + 1; j <= i1; j++) {
+				if (OP[j]) { j++; continue }
+				if ((k = index(WD[j], "=")) > 1) push(substr(WD[j], k + 1))
+			}
+			return 0
+		}
 		if (b == "watch") { j = skipopts(b, i + 1, i1); if (j <= i1) push(join(j, i1, 0)); return 0 }
 		# watchexec [OPTIONS] [--] COMMAND...: run by a shell, joined.
 		if (b == "watchexec") { j = skipopts(b, i + 1, i1); if (j <= i1) push(join(j, i1, 0)); return 0 }
-		if (b == "parallel" || b == "sem") return parallel(i, i1)
+		if (b == "parallel" || b == "sem") return parallel(i, i1) ? mcode() : 0
 		if (b == "hyperfine") { hyperfine(i, i1); return 0 }
 		if (b == "nodemon") { nodemon(i, i1); return 0 }
 		if (b == "npx" || b == "bunx") { npx(i, i1); return 0 }
+		if (b == "npm" || b == "pnpm" || b == "yarn" || b == "bun") { if (j = npmexec(b, i, i1)) npx(j, i1); return 0 }
 		# trap [-lpP] [--] CODE SIGNAL...: CODE runs later.
 		if (b == "trap") {
 			for (j = i + 1; j <= i1 && WD[j] ~ /^-[lpP]+$/; j++) ;
@@ -1709,13 +1935,16 @@ scan() {
 		}
 		if (b == "tmux") { tmux(i, i1); return 0 }
 		if (b == "su" || b == "runuser") { PATHSET = 1; su(i, i1); return 0 }
-		if (istool(b, x, WD[i])) { found(b); return 0 }
+		# Under pixi (PXM) a program comes from the pixi environment: only a
+		# package installer is refused there.
+		if (PXM) { if (pxinst(b, i, i1)) return 0 }
+		else if (istool(b, x, WD[i])) { found(b); return 0 }
 		if (b == "source" || b == ".") {
 			# source FILE: a venv; /dev/stdin (reads stdin) or <(...) (code).
 			for (j = i + 1; j <= i1 && OP[j]; j += 2) ;
 			if (j > i1) return 0
-			if (WD[j] ~ /(^|\/)bin\/activate/) { found("venv activate"); return 0 }
-			if (WD[j] ~ STDIN) { stdin(i0, i1); return 1 }
+			if (WD[j] ~ /(^|\/)bin\/activate/) { if (!PXM) found("venv activate"); return 0 }
+			if (WD[j] ~ STDIN) { stdin(i0, i1); return mcode() }
 			if (WD[j] == "<()") feed(j)
 			return 0
 		}
@@ -1873,23 +2102,133 @@ scan() {
 			if (x ~ /^-([weidP]|-(watch|ext|ignore|delay|config|signal|cwd|polling-interval))$/) { j++; continue }
 			if (x == "--" || x !~ /^-/) break
 		}
-		for (; j <= i1 && !OP[j]; j++) if (WD[j] !~ /^-/) { if (WD[j] ~ /\.py$/) found("python"); return }
+		for (; j <= i1 && !OP[j]; j++) if (WD[j] !~ /^-/) { if (WD[j] ~ /\.py$/ && !PXM) found("python"); return }
 	}
-	# npx -c CMD (or --call): CMD is shell code. npx [-y]
+	# npx (npm exec, bunx, bun x, pnpm exec / dlx, yarn exec / dlx) [OPTIONS]
+	# [--] COMMAND...: -c CMD (or --call, pnpm'"'"'s --shell-mode) is shell code;
+	# else COMMAND is a command (a package'"'"'s bin, any program on PATH with -p
+	# PKG, and in npm 6'"'"'s npx one on PATH anyway). npx [-y]
 	# @modelcontextprotocol/inspector [OPTIONS] [--] COMMAND...: the MCP
 	# inspector starts COMMAND (the server).
 	function npx(i, i1,    j) {
 		for (j = i + 1; j <= i1 && !OP[j] && WD[j] ~ /^-/; j++) {
-			if (WD[j] == "-c" || WD[j] == "--call") { if (j < i1) code(j + 1); return }
+			# (after --, an option is the command: npm reads none)
+			if (WD[j] == "--") { j++; break }
+			if (WD[j] == "-c" || WD[j] == "--call" || WD[j] == "--shell-mode") { if (j < i1) code(j + 1); return }
 			if (WD[j] ~ /^--call=/) { push(substr(WD[j], 8)); return }
-			if (WD[j] == "-p" || WD[j] == "--package") j++
+			if (index(NPV, " " WD[j] " ")) j++
 		}
-		if (j > i1 || WD[j] !~ /^@modelcontextprotocol\/inspector(@[^\/]*)?$/) return
+		if (j > i1) return
+		if (WD[j] !~ /^@modelcontextprotocol\/inspector(@[^\/]*)?$/) { check(j, i1); return }
 		for (j++; j <= i1 && !OP[j] && WD[j] ~ /^-/; j++) {
 			if (WD[j] == "--") { j++; break }
 			if (WD[j] ~ /^(-e|--(config|server|transport|server-url|header|method|tool-name|tool-arg|uri|prompt-name|prompt-args|log-level|target))$/) j++
 		}
 		if (j <= i1) check(j, i1)
+	}
+	# npm [OPTIONS] exec|x, pnpm [OPTIONS] exec|dlx, yarn [OPTIONS] exec|dlx,
+	# bun x: the index of that word (the rest is read as npx'"'"'s), else 0.
+	# Options are skipped (NPV: those that take a value); the first other word
+	# is the command.
+	function npmexec(b, i, i1,    j, x) {
+		for (j = i + 1; j <= i1 && !OP[j]; j++) {
+			x = WD[j]
+			if (x ~ /^-/) { if (index(NPV, " " x " ")) j++; continue }
+			if ((x == "exec" && b != "bun") || (x == "x" && (b == "npm" || b == "bun")) || (x == "dlx" && (b == "pnpm" || b == "yarn"))) return j
+			return 0
+		}
+		return 0
+	}
+	# pixi [-v|--color C|...] run|exec [OPTIONS] [--] COMMAND...: what pixi runs
+	# comes from its environment, so only a package installer is refused there:
+	# pip install, python -m pip install, uv pip install and uv add change the
+	# environment behind pixi.lock'"'"'s back (pixi exec: its cached environment,
+	# behind its specs'"'"'). COMMAND is read by the scanner in pixi mode (PXM,
+	# see pxinst), wrappers, shells and all. One word is a shell line to pixi
+	# (pixi run "cd sub && pip install x"), queued as code; more are a program
+	# and its arguments, each one word. Returns what check() does for it (a
+	# shell reading stdin: pixi run bash <<EOF, 2 or 3, see mcode), and what
+	# pixi run echo prints goes into the command'"'"'s pipeline (ECKD). What it
+	# sets (PATH, a folder) is not the outer command'"'"'s.
+	function pixi(i, i1,    j, k, s, pm, ps, pc, pe, r) {
+		for (j = i + 1; j <= i1 && !OP[j] && WD[j] ~ /^-/; j++) if (WD[j] == "--color") j++
+		if (j > i1 || OP[j]) return 0
+		s = WD[j]; if (s == "r") s = "run"; else if (s == "x") s = "exec"
+		if (s != "run" && s != "exec") return 0
+		j = skipopts("pixi " s, j + 1, i1)
+		for (; j <= i1 && OP[j]; j += 2) ;
+		if (j > i1) return 0
+		for (k = j + 1; k <= i1 && OP[k]; k += 2) ;
+		pm = PXM; ps = PATHSET; pc = CDX; pe = ECKD; PXM = s; r = 0
+		if (k > i1 && WD[j] !~ safe) push(WD[j])
+		else { if (ECKD == CKD) ECKD = CKD + 1; r = check(j, i1) }
+		PXM = pm; PATHSET = ps; CDX = pc; ECKD = pe
+		return r
+	}
+	# Under pixi (PXM): is WD[i] (base name b) with its arguments a package
+	# installer: pip install, python -m pip install (python'"'"'s options skipped,
+	# -Im too), uv pip install, uv add? Then found() and 1.
+	function pxinst(b, i, i1,    k, x, m, c, mod) {
+		if (b ~ /^pip[0-9.]*$/) return pipargs(b, i + 1, i1)
+		if (b == "uv") return uvargs("uv", i + 1, i1)
+		if (b !~ /^(python|pypy)[0-9.]*$/) return 0
+		spent(i1 - i)
+		for (k = i + 1; k <= i1; k++) {
+			if (OP[k]) { k++; continue }
+			x = WD[k]
+			# (a script, or - for stdin: not -m)
+			if (x !~ /^-./ || x == "--") return 0
+			if (x ~ /^--/) { if (x == "--check-hash-based-pycs") k++; continue }
+			m = chars(x, OC); mod = "-"
+			for (c = 2; c <= m; c++) {
+				if (OC[c] == "c") return 0
+				if (OC[c] == "m") {
+					if (c < m) mod = substr(x, c + 1)
+					else { for (k++; k <= i1 && OP[k]; k += 2) ; mod = k <= i1 ? WD[k] : "" }
+					break
+				}
+				if (OC[c] == "W" || OC[c] == "X") { if (c == m) k++; break }
+			}
+			if (mod == "-") continue
+			if (mod == "pip" || mod == "pip.__main__") return pipargs(b " -m pip", k + 1, i1)
+			if (mod == "uv") return uvargs(b " -m uv", k + 1, i1)
+			return 0
+		}
+		return 0
+	}
+	# pip'"'"'s arguments WD[k..i1] (w: how it was run): its options skipped
+	# (PIPV: those that take a value), the first word that is a pip command
+	# decides (another may be the value of an option not known here).
+	function pipargs(w, k, i1,    x) {
+		spent(i1 - k + 1)
+		for (; k <= i1; k++) {
+			if (OP[k]) { k++; continue }
+			x = WD[k]
+			if (x ~ /^-/) { if (index(PIPV, " " x " ")) k++; continue }
+			if (!(x in PIPC)) continue
+			if (x != "install") return 0
+			found("pixi " PXM " " w " install"); return 1
+		}
+		return 0
+	}
+	# uv'"'"'s arguments WD[k..i1], the same way: uv add, uv pip install.
+	function uvargs(w, k, i1,    x, p) {
+		spent(i1 - k + 1); p = 0
+		for (; k <= i1; k++) {
+			if (OP[k]) { k++; continue }
+			x = WD[k]
+			if (x ~ /^-/) { if (index(UVV, " " x " ")) k++; continue }
+			if (!p) {
+				if (!(x in UVC)) continue
+				if (x == "add") { found("pixi " PXM " " w " add"); return 1 }
+				if (x != "pip") return 0
+				p = 1; continue
+			}
+			if (!(x in UVPC)) continue
+			if (x != "install") return 0
+			found("pixi " PXM " " w " pip install"); return 1
+		}
+		return 0
 	}
 	# A rough look at range r (a >(...) body): does it start with a shell
 	# reading stdin (bash, sh -s; not sh -c CODE or sh FILE)?
@@ -1926,7 +2265,7 @@ scan() {
 	# What the range queued for word j ($(...) or <(...), see endword) prints
 	# is code: its heredocs, echo / printf words and here-strings are read as
 	# commands, as if piped into a shell.
-	function feed(j) { if (PR[j]) RF[PR[j]] = 1 }
+	function feed(j) { if (PR[j]) RF[PR[j]] = mcode() }
 	# A shell (or source) reading stdin at WD[i0..i1]: a here-string, or a
 	# <(...) redirected in, is code.
 	function stdin(i0, i1,    j) {
@@ -1991,6 +2330,13 @@ scan() {
 # does not read).
 askany() {
 	printf '%s' "$1" | awk 'BEGIN { RS = "\001" } askrec($0) { print "ask"; exit }'"$ASKREC"
+}
+
+# "ask" if a PIXI_GUARD=ask assignment is in JSON text $1 (a payload too big to
+# read, see jindex): as askany, also after a quote and before one, or an
+# escaped one (["PIXI_GUARD=ask", ...], "PIXI_GUARD=\"ask\" ...").
+askjson() {
+	printf '%s' "$1" | awk 'BEGIN { RS = "\001" } index($0, "PIXI_GUARD=") && $0 ~ /(^|[;&|( \t"])PIXI_GUARD=(\\"ask\\"|\047ask\047|ask)([ \t"]|\\[nt])/ { print "ask"; exit }'
 }
 
 # scan()'s output, or "complex" (and "ask", see askany) if the scan is still
@@ -2145,15 +2491,22 @@ envbin() {
 }
 
 # cwd: the payload's, as a physical path, so the wrapper key matches `guard.sh
-# wrap-path` (/tmp vs /private/tmp). A job runs in its own cwd (tool_input's,
-# relative to the session's) when it gives one that exists (checkpoint
-# refuses the job otherwise).
+# wrap-path` (/tmp vs /private/tmp). A job (checkpoint's or the gateway's)
+# runs in its own cwd (tool_input's $jc, relative to the session's) when it
+# gives one that exists (checkpoint and the gateway refuse the job otherwise).
+# A gateway job with none runs in the project: $CLAUDE_PROJECT_DIR (the
+# gateway's MCP server has it too), else the session's folder; also one in a
+# workspace (the MCP server fills in the cwd before the workspace applies, and
+# the gateway refuses a cwd outside it). A gateway terminal's folder is not
+# known: the session's stands in for the advice (and relative *.py paths are
+# not looked up there, see TCD).
 getcwd() {
 	[ -n "${cwd:-}" ] && return
 	cwd=$(field cwd)
 	[ -n "$cwd" ] || cwd=$PWD
 	cwd=$(cd "$cwd" 2>/dev/null && pwd -P) || cwd=$PWD
-	if [ -n "$job" ] && jc=$(field cwd tool_input) && [ -n "$jc" ]; then
+	[ -z "$jc" ] && [ "$job" = gw ] && jc=${CLAUDE_PROJECT_DIR:-}
+	if [ -n "$jc" ]; then
 		case $jc in /*) ;; *) jc=$cwd/$jc ;; esac
 		jc=$(cd "$jc" 2>/dev/null && pwd -P) && cwd=$jc
 	fi
@@ -2173,7 +2526,7 @@ wrap-path)
 	;;
 
 session)
-	msg="pixi-guard: on this machine Python runs only through pixi. Use \`pixi run ...\` in a pixi workspace, \`pixi exec [--spec pkg] python ...\` for one-offs, \`pixi add pkg\` (conda-forge) or \`pixi add --pypi pkg\` for packages. Never run python, pip, uv, conda, poetry and the like directly: commands that do are refused (Bash, Monitor, the desktop app's terminal tool, and checkpoint's job_start: make a job's command \`pixi run python train.py\`, not \`python train.py\`). For a project that is not on pixi, load the skill pixi:project (convert it, or wrap it if it isn't the user's code)."
+	msg="pixi-guard: on this machine Python runs only through pixi. Use \`pixi run ...\` in a pixi workspace, \`pixi exec [--spec pkg] python ...\` for one-offs, \`pixi add pkg\` (conda-forge) or \`pixi add --pypi pkg\` for packages. Never run python, pip, uv, conda, poetry and the like directly, nor \`pixi run pip install\`: commands that do are refused (Bash, Monitor, the desktop app's terminal tool, checkpoint's job_start, and the gateway's job_start and terminal_send: make a job's command \`pixi run python train.py\`, not \`python train.py\`). For a project that is not on pixi, load the skill pixi-guard:project (convert it, or wrap it if it isn't the user's code)."
 	if p=$(pixi_where); then
 		command -v pixi >/dev/null 2>&1 ||
 			msg="$msg pixi is installed at $p, which may not be on PATH: if \`pixi\` is not found in Bash, run it by that path."
@@ -2188,17 +2541,65 @@ session)
 	;;
 
 pre)
-	# A command string (Bash, Monitor, the terminal tool, job_start), else
-	# job_start's argv list (checkpoint takes the command when it is not
-	# empty). checkpoint runs a job detached with /bin/sh, in the job's cwd.
-	job=
-	[ "$(field tool_name)" = mcp__plugin_check_jobs__job_start ] && job=1
-	cmd=$(field command)
-	[ -n "$cmd" ] || { cmd=$(argvcmd); job=1; }
+	# A command string (Bash, Monitor, the terminal tool, a job_start), else
+	# a job_start's argv list (checkpoint takes the command when it is not
+	# empty; the gateway refuses a job with both), or the text typed into a
+	# gateway terminal (terminal_send). checkpoint runs a job detached with
+	# /bin/sh, in the job's cwd (job=check); the gateway runs a job in the
+	# job's cwd (job=gw) and a terminal's text (term=1) in its own bash.
+	# A payload over 1MB is not read at all: jindex's walk takes up to about
+	# 0.9 s per MB (under gawk), and it runs before the scan's watchdog starts.
+	# (A command the scan reads is at most 256KB, which JSON writes in well
+	# under 1MB unless most of it is control characters.)
+	n=$(printf '%s' "$input" | wc -c)
+	# (unquoted: wc may print blanks before the number)
+	if [ ${n:-0} -gt 1048576 ]; then jix=cut; else jix=$(jindex); fi
+	# (see jindex: a payload too big to read is refused, as a command too big to
+	# scan is; PIXI_GUARD=ask still asks)
+	if [ "$jix" = cut ]; then
+		if [ -n "$(askjson "$input")" ]; then
+			out_decision ask "pixi-guard: this tool call is too large for pixi-guard to read. Claude asked to run it anyway; allow it?"
+		else
+			out_decision deny "pixi-guard: refused, this tool call's input is too large (or too deeply nested) for pixi-guard to read, so it can't check whether it runs Python outside pixi. Split it into smaller commands. Only if the user explicitly wants it run as it is, put \`PIXI_GUARD=ask\` in front of its command: that shows them a permission prompt. Don't use that to get around pixi on your own."
+		fi
+		exit 0
+	fi
+	job= term= hostid= jc=
+	case $(field tool_name) in
+	mcp__plugin_check_jobs__job_start) job=check ;;
+	mcp__plugin_gate_gw__job_start)
+		job=gw
+		# A job on another host runs there: not checked (like ssh HOST python).
+		# No host, "" and localhost are this machine, and so (to the gateway)
+		# is its own m_ id, which is not known here: an m_ id is checked.
+		h=$(field host tool_input)
+		case $h in
+		"" | localhost) ;;
+		# (m_ and 26 of a-z2-7; no ranges: their meaning depends on the locale)
+		m_*) case ${h#m_} in *[!abcdefghijklmnopqrstuvwxyz234567]*) exit 0 ;; esac; [ ${#h} -eq 28 ] || exit 0; hostid=1 ;;
+		*) exit 0 ;;
+		esac ;;
+	mcp__plugin_gate_gw__terminal_send) term=1 ;;
+	esac
+	# (tool_input's top-level keys only, see jindex)
+	if [ -n "$term" ]; then
+		cmd=$(field text tool_input)
+	else
+		cmd=$(field command tool_input)
+		[ -n "$cmd" ] || { cmd=$(argvcmd); [ -n "$job" ] || job=check; }
+	fi
 	[ -n "$cmd" ] || exit 0
-	# (read by scan: see B32, B52 and VB there)
-	b32=0 b52=0 vb=0 cwd=
-	if [ -n "$job" ]; then bashver "${PIXI_GUARD_JOB_SH:-/bin/sh}"; else bashver; fi
+	[ -n "$job" ] && jc=$(field cwd tool_input)
+	# (read by scan: see B32, B52, VB, TCD and GWP there)
+	b32=0 b52=0 vb=0 tcd=0 gwp=0 cwd=
+	case $job$term in
+	check) bashver "${PIXI_GUARD_JOB_SH:-/bin/sh}" ;;
+	# The gateway's own bash: bash 5 (its pixi.toml pins "5.*", locked at
+	# 5.2.37), with the gateway's own PATH (gwp).
+	gw) b52=1 gwp=1 ;;
+	1) b52=1 gwp=1 tcd=1 ;;
+	*) bashver ;;
+	esac
 	[ -n "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ] && [ -n "$(envdirs)" ] && vb=1
 	# (stderr off: bash reports a killed background job there)
 	res=$(exec 2>/dev/null; watched_scan "$cmd")
@@ -2229,29 +2630,54 @@ py "*) getcwd; hit=$(pyscript) ;; esac
 			note="$note This same command writes \`$hit\`, and pixi-guard reads a script's #! line from disk before the command runs, so it would go by the old file (or none). Write the file first (with the Write tool, or in a separate command), then run it by its path in a command of its own: a *.py script whose #! line runs pixi, such as \`#!/usr/bin/env -S pixi exec --spec <pkg> -- python\`, is let through then."
 		else
 			note="$note A *.py script whose #! line runs pixi, such as \`#!/usr/bin/env -S pixi exec --spec <pkg> -- python\`, may be run by its path."
-			has pycd && note="$note A relative path is not looked up after \`cd\` (or another change of folder) in the same command: run it by its absolute path, or from the current folder."
+			if [ -n "$term" ]; then
+				has pycd && note="$note pixi-guard doesn't know a terminal's folder, so a relative path is not looked up there: type its absolute path."
+			else
+				has pycd && note="$note A relative path is not looked up after \`cd\` (or another change of folder) in the same command: run it by its absolute path, or from the current folder."
+			fi
 		fi ;;
 	esac
-	# How to say it: for a job, its command and /bin/sh (see bashver).
-	if [ -n "$job" ]; then
+	# How to say it: for a job, its command and the shell that runs it (see
+	# bashver); for a terminal, what is typed into it.
+	case $job$term in
+	check | gw)
 		what=job shis="checkpoint runs the job with /bin/sh, which here is"
-		again="start the job again with \`PIXI_GUARD=ask\` in front of its command (with \`argv\`, as its first element)"
-	else
+		[ "$job" = gw ] && shis="the gateway runs the job with its own bash, which is"
+		again="start the job again with \`PIXI_GUARD=ask\` in front of its command (with \`argv\`, as its first element)" ;;
+	1)
+		what="terminal input" shis="the gateway's terminal runs its own bash, which is"
+		again="send it again as \`PIXI_GUARD=ask <command>\`" ;;
+	*)
 		what=command shis="Claude Code's shell here is"
-		again="re-run it as \`PIXI_GUARD=ask <command>\`"
+		again="re-run it as \`PIXI_GUARD=ask <command>\`" ;;
+	esac
+	[ -n "$hostid" ] && note="$note (If \`host\` is another machine's id, name that host as gateway.toml does: pixi-guard doesn't check jobs on other hosts.)"
+	if has pathset; then
+		if [ "$gwp" = 1 ]; then
+			gws="The gateway runs the job"; [ -n "$term" ] && gws="The gateway's terminal runs it"
+			note="$note $gws with a PATH of its own (the gateway's folders, gateway.toml's [shell] import_path if set, then /usr/bin, /bin, /usr/sbin and /sbin), not the one pixi-guard sees, so pixi-guard can't tell where \`$hit\` would come from there."
+		else
+			note="$note This command runs it with a PATH of its own (it sets PATH, or uses sudo, su, env -i or xcrun), so pixi-guard can't tell where \`$hit\` would come from."
+		fi
+		note="$note One installed with pixi global or in a pixi environment can be run by its path (\`~/.pixi/bin/$hit\`, \`.pixi/envs/default/bin/$hit\`)."
 	fi
-	has pathset && note="$note This command runs it with a PATH of its own (it sets PATH, or uses sudo, su or env -i), so pixi-guard can't tell where \`$hit\` would come from. One installed with pixi global or in a pixi environment can be run by its path (\`~/.pixi/bin/$hit\`, \`.pixi/envs/default/bin/$hit\`)."
 	[ "$tag" = b32 ] &&
 		note="$note Note: $shis bash 3.2 (macOS's /bin/bash). It ends a \`\$(...)\` at the first \`)\` outside the quotes it sees, even one in a quoted heredoc or a case pattern, and there apostrophes pair up as quotes (Don't ... it's). What follows that \`)\` is read as the rest of the command, where backticks and \`\$(...)\` run. For a commit message or PR body, write it to a file and use \`git commit -F FILE\` (\`gh pr create --body-file FILE\`)."
 	[ "$tag" = b52 ] &&
 		note="$note Note: $shis bash 5.2 or later. Inside \`\$(...)\` it ends a heredoc at a line that starts with the delimiter and has a \`)\` after it (such as \`EOFError ... :)\`), and reads the rest of that line as commands; that \`)\` can end the \`\$(...)\`, and backticks and \`\$(...)\` after it run. For a commit message or PR body, write it to a file and use \`git commit -F FILE\` (\`gh pr create --body-file FILE\`)."
-	override="Only if the user explicitly wants it run outside pixi, $again: that shows them a permission prompt. Don't use that to get around pixi on your own."
+	# A package installer run by pixi (pixi run pip install, see pixi() in
+	# scan) is in pixi, but behind its lock file's back.
+	case $hit in
+	"pixi "*) px=1 runs="runs \`$hit\`, which installs packages behind pixi's back" how="this way" ;;
+	*) px= runs="runs \`$hit\` outside pixi" how="outside pixi" ;;
+	esac
+	override="Only if the user explicitly wants it run $how, $again: that shows them a permission prompt. Don't use that to get around pixi on your own."
 
 	if printf '%s\n' "$res" | grep -qx ask; then
 		if [ -n "$complex" ]; then
 			out_decision ask "pixi-guard: this $what is too large or nested for pixi-guard to check for Python. Claude asked to run it anyway; allow it?"
 		else
-			out_decision ask "pixi-guard: this $what runs \`$hit\` outside pixi. Claude asked to run it this way anyway; allow it?"
+			out_decision ask "pixi-guard: this $what $runs. Claude asked to run it this way anyway; allow it?"
 		fi
 		exit 0
 	fi
@@ -2261,9 +2687,14 @@ py "*) getcwd; hit=$(pyscript) ;; esac
 	fi
 
 	getcwd
-	why="pixi-guard: refused, \`$hit\` would run Python outside pixi.$note"
+	case $hit in
+	"pixi exec "*) why="pixi-guard: refused, \`$hit\` installs into a cached \`pixi exec\` environment, which later \`pixi exec\` runs with the same specs reuse.$note" ;;
+	"pixi "*) why="pixi-guard: refused, \`$hit\` changes the pixi environment behind pixi.lock's back (pixi warns about that, and the next \`pixi install\` can undo it).$note" ;;
+	*) why="pixi-guard: refused, \`$hit\` would run Python outside pixi.$note" ;;
+	esac
 
-	if ! pixi_where >/dev/null; then
+	# (a pixi run ... refusal: pixi is there, or the command fails anyway)
+	if [ -z "$px" ] && ! pixi_where >/dev/null; then
 		sid=$(field session_id | tr -c 'A-Za-z0-9_-' '_' | cut -c 1-128)
 		if [ -n "$sid" ] && [ -e "$told/$sid" ]; then
 			todo="pixi is still not found (the user has been told). Wait for the user to install it, or, if they said to go ahead without pixi, $again so they can approve it."
@@ -2280,6 +2711,10 @@ py "*) getcwd; hit=$(pyscript) ;; esac
 
 	# Installers and env managers map to `pixi add`; everything else to `pixi run`.
 	case $hit in
+	"pixi exec "*)
+		use="name the packages a one-off needs with \`pixi exec --spec <pkg> ...\` (\`--with <pkg>\` keeps the one guessed from the command); for ongoing work, a workspace and \`pixi add <pkg>\`" ;;
+	"pixi "*)
+		use="add packages with \`pixi add <pkg>\` (conda-forge, preferred) or \`pixi add --pypi <pkg>\` (the project itself: \`pixi add --pypi --editable \"<name> @ file://\$PWD\"\`), so they go in pixi.lock; then \`pixi run ...\`" ;;
 	pip* | uv | uvx | easy_install* | conda | mamba | micromamba | poetry | pipenv | pyenv | virtualenv | hatch | pdm | rye | "venv activate" | *" "*)
 		use="manage packages with \`pixi add <pkg>\` (conda-forge, preferred) or \`pixi add --pypi <pkg>\`, and the environment with \`pixi install\` / \`pixi run\`; no separate venv or installer" ;;
 	*)
@@ -2297,14 +2732,14 @@ py "*) getcwd; hit=$(pyscript) ;; esac
 		todo="$proj_root is wrapped by the pixi workspace $proj_manifest (kept outside the folder). Use it with \`--manifest-path '$proj_manifest'\` on every pixi command: $use."
 		;;
 	python)
-		todo="$proj_root is a Python project that is not on pixi. Load the skill pixi:project and follow it: ask the user once whether to convert this project to pixi (their own code) or wrap it without changing tracked files (someone else's code). If nothing may be added to the folder at all, put the wrapper at $(wrap_manifest "$proj_root")."
+		todo="$proj_root is a Python project that is not on pixi. Load the skill pixi-guard:project and follow it: ask the user once whether to convert this project to pixi (their own code) or wrap it without changing tracked files (someone else's code). If nothing may be added to the folder at all, put the wrapper at $(wrap_manifest "$proj_root")."
 		;;
 	*)
 		todo="No pixi workspace here. For a one-off use \`pixi exec --spec python --spec <pkg> python ...\`; for a script, \`pixi init --script file.py\` and \`pixi exec\`; for ongoing work, \`pixi init\` (ask the user before creating a workspace)."
 		;;
 	esac
 	# (a job: the pixi command goes in the job, not in Bash)
-	case $job$proj_kind in
+	case ${job:+1}$proj_kind in
 	1python) todo="$todo Then $use." ;;
 	1none) todo="$todo The job's command is then that pixi command, such as \`pixi exec --spec python python ...\` (with \`argv\`, \"pixi\" first)." ;;
 	esac

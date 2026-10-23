@@ -14,7 +14,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|Monitor|mcp__terminal__run_in_terminal|mcp__plugin_check_jobs__job_start",
+        "matcher": "Bash|Monitor|mcp__terminal__run_in_terminal|mcp__plugin_check_jobs__job_start|mcp__plugin_gate_gw__job_start|mcp__plugin_gate_gw__terminal_send",
         "hooks": [
           {
             "type": "command",

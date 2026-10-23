@@ -1,0 +1,47 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"   # weekly, with the newest pixi
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}${{ matrix.pixi == 'v0.68.0' && ' (oldest pixi)' || '' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+        pixi: [v0.81.0]
+        include:
+          - os: ubuntu-24.04
+            pixi: v0.68.0      # oldest pixi tested
+    defaults:
+      run:
+        working-directory: plugins/pixi-guard
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514  # v0.11.0
+        with:
+          pixi-version: ${{ github.event_name == 'schedule' && 'latest' || matrix.pixi }}
+          manifest-path: plugins/pixi-guard/pixi.toml
+          locked: true
+      - name: Other awks and shells for the matrix
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q gawk mawk busybox dash
+          else
+            brew install gawk mawk
+          fi
+      - name: Suite
+        run: pixi run --locked test
+      - name: Suite under every awk and sh found
+        run: pixi run --locked test-matrix
