@@ -51,6 +51,12 @@ Some checks measure the hook's CPU time against a budget, and run once more
 before failing. On a heavily loaded machine a timing check can still fail;
 run it again before looking for a bug.
 
+## 0.4.1 verification
+
+Run on 2026-10-26 (macOS arm64): the suite, 3354 passed (a README check
+added). The change is to the README and the tests only; nothing else was
+rerun (0.4.0's runs below).
+
 ## 0.4.0 verification
 
 Run on 2026-10-24 and 25 (Claude Code 2.1.310 on macOS and Linux; pixi
@@ -72,9 +78,13 @@ Run on 2026-10-24 and 25 (Claude Code 2.1.310 on macOS and Linux; pixi
   macOS and Linux: every check passed (96 of 96 in that script on each).
   Python refused in Bash, in both plugins' `job_start` and in the gateway's
   `terminal_send`, while the other plugins keep working.
+- An install from GitHub of the released version (3006155, on 2026-10-26):
+  on macOS untagged and tag-pinned, the update from 0.3.0, the uninstall
+  forms, and live sessions with checkpoint and the gateway; on the Debian VM
+  the install and live sessions with both. `python3` was refused in each
+  session that ran it.
 - Not run: the suite through Rosetta, busybox awk, the skill's convert, wrap
-  and unwrap in a live session, an install from GitHub of the released
-  version.
+  and unwrap in a live session.
 
 ## 0.3.0 verification
 

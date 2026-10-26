@@ -172,13 +172,13 @@ From a shell (in Claude Code, `/plugin` opens the same actions as a menu):
 |---|---|
 | Update | `claude plugin marketplace update pixi-guard`, then `claude plugin update pixi-guard@pixi-guard`; then `/reload-plugins` in a running session, or start a new one |
 | Turn off for now | `claude plugin disable pixi-guard@pixi-guard` (back on: `claude plugin enable pixi-guard@pixi-guard`) |
-| Uninstall | `claude plugin uninstall pixi-guard@pixi-guard` |
-| Forget the marketplace | `claude plugin marketplace remove pixi-guard` |
+| Uninstall | `claude plugin uninstall pixi-guard@pixi-guard` (`--keep-data` keeps its data folder) |
+| Forget the marketplace | `claude plugin marketplace remove pixi-guard` (also uninstalls the plugin and deletes its data folder) |
 
-Uninstalling removes the hook, the skill and the plugin's data folder
-(`~/.claude/plugins/data/pixi-guard-pixi-guard`, under `$CLAUDE_CONFIG_DIR`
-if set; it holds small per-session markers). What it set up in your projects
-stays. Remove what you don't want (before you uninstall, Claude can remove a
+Uninstalling removes the hook, the skill and, without `--keep-data`, the
+plugin's data folder (`~/.claude/plugins/data/pixi-guard-pixi-guard`, under
+`$CLAUDE_CONFIG_DIR` if set; it holds small per-session markers). What it set
+up in your projects stays. Remove what you don't want (before you uninstall, Claude can remove a
 wrapper for you: ask it to unwrap the project):
 
 - **Wrappers outside a project:** a folder per project under

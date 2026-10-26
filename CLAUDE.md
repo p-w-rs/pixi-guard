@@ -1,6 +1,6 @@
 # CLAUDE.md: working on pixi-guard
 
-The plugin is `plugins/pixi-guard/` (plugin name `pixi-guard`, v0.4.0). User docs:
+The plugin is `plugins/pixi-guard/` (plugin name `pixi-guard`, v0.4.1). User docs:
 [README.md](README.md); the full limits list is
 [docs/dev/LIMITS.md](docs/dev/LIMITS.md), the suite and what a release's
 verification covers [docs/dev/TESTING.md](docs/dev/TESTING.md), releases

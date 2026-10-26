@@ -2841,6 +2841,16 @@ check("the skill's folder is skills/project", (ROOT / "skills" / "project" / "SK
 readme = (REPO / "README.md").read_text()
 check("README installs it by its id", f"/plugin install {pj['name']}@{mk['name']}" in readme, pj["name"])
 check("README names the skill by its id", f"{pj['name']}:project" in readme and "`pixi:project`" not in readme)
+# Claude Code's `marketplace remove` uninstalls the plugin and deletes its data folder; only `uninstall` has --keep-data.
+rows = {m.group(1): m.group(2) for m in re.finditer(r"(?m)^\| (Uninstall|Forget the marketplace) \| (.*) \|$", readme)}
+check("README: removing the marketplace also uninstalls the plugin and deletes its data folder",
+      f"marketplace remove {mk['name']}" in rows.get("Forget the marketplace", "")
+      and re.search(r"uninstalls the plugin and deletes its data folder", rows.get("Forget the marketplace", "")), rows)
+check("README: uninstall's --keep-data keeps the data folder",
+      re.search(r"`--keep-data` keeps its data folder", rows.get("Uninstall", "")), rows)
+unote = re.search(r"(?ms)^Uninstalling .*?(?=\n\n)", readme)
+check("README: the note under the table keeps --keep-data's exception for the data folder",
+      unote and "data folder" in unote.group(0) and "without `--keep-data`" in unote.group(0), unote and unote.group(0))
 check("no top-level bin/ in the plugin", not (ROOT / "bin").exists())
 # Latest only: the dev manifest needs the pixi that made pixi.lock (the newest then; moved with every relock, see
 # docs/dev/TESTING.md), with no upper bound, and every dependency is "*".

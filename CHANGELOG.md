@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1 (2026-10-26)
+
+Fixed:
+
+- README: says that removing the marketplace also uninstalls the plugin and
+  deletes its data folder, and that `claude plugin uninstall --keep-data`
+  keeps that folder.
+- docs/dev/TESTING.md: the 0.4.0 verification now lists the install from
+  GitHub of the released version.
+
 ## 0.4.0 (2026-10-26)
 
 Only the latest Claude Code and pixi are supported.
