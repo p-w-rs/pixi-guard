@@ -16,13 +16,21 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = ROOT.parents[1]
 GUARD = ROOT / "hooks" / "guard.sh"
 PIXI_SH = ROOT / "hooks" / "pixi.sh"
-TMP = Path(tempfile.mkdtemp(prefix="pixi-guard-test-")).resolve()
+# (no "bash" or "zsh" in its path: the shell prefix tests take a path that holds one for that shell)
+for _ in range(20):
+    TMP = Path(tempfile.mkdtemp(prefix="pixi-guard-test-")).resolve()
+    if "bash" not in str(TMP) and "zsh" not in str(TMP):
+        break
+    TMP.rmdir()
+else:
+    sys.exit(f"pixi-guard tests: the temp folder's path holds bash or zsh, which the shell prefix tests read: {TMP}")
 FAKE_PIXI = TMP / "bin" / "pixi"
 FAKE_PIXI.parent.mkdir()
 FAKE_PIXI.write_text('#!/bin/sh\necho "fake pixi $*"\n')
@@ -45,10 +53,10 @@ def pixi_bin(d):
 BASE_PATH = os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep) if d and not pixi_bin(d))
 # PATH without any pixi on it either, for the "find pixi off PATH" tests.
 NOPIXI_PATH = os.pathsep.join(d for d in BASE_PATH.split(os.pathsep) if not os.access(os.path.join(d, "pixi"), os.X_OK))
-SCRUB = ("PIXI_GUARD_TOOLS", "PIXI_GUARD_PIXI", "PIXI_GUARD_HOME", "PIXI_GUARD_WRAP_DIR", "PIXI_GUARD_WATCHDOG", "PIXI_GUARD_JOB_SH", "PIXI_HOME",
+SCRUB = ("PIXI_GUARD_TOOLS", "PIXI_GUARD_PIXI", "PIXI_GUARD_HOME", "PIXI_GUARD_WRAP_DIR", "PIXI_GUARD_WATCHDOG", "PIXI_GUARD_JOB_SH", "PIXI_GUARD_SHELL_DIRS", "PIXI_HOME",
          "CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR", "XDG_STATE_HOME", "XDG_DATA_HOME",
-         # read by the hook: Claude Code's shell (bash 3.x reads $(...) its own way), the active envs
-         "SHELL", "CLAUDE_CODE_SHELL", "VIRTUAL_ENV", "CONDA_PREFIX")
+         # read by the hook: Claude Code's shell (bash 3.x reads $(...) its own way) and its prefix, the active envs
+         "SHELL", "CLAUDE_CODE_SHELL", "CLAUDE_CODE_SHELL_PREFIX", "VIRTUAL_ENV", "CONDA_PREFIX")
 
 PASS = 0
 FAIL = 0
@@ -745,6 +753,13 @@ expect("deny", [
     "if true; then case $x in a) python y;; esac; fi", "echo $(echo case in a) && pip list",
     "case $x in a) echo;; esac&&python x",
 ])
+# An escaped character is part of a word: \(case is no keyword and \(# no comment, so a ")" after them ends the
+# $(...) (the real shells agree, see below).
+esc_deny = ["x=\"$( \\(case x in x) \" ; pip list", "x=\"$( \\(#)\" ; pip list", "x=\"$(echo a\\;case x in x) \" ; pip list",
+            "x=$(echo \\(x # )\npip list\n)"]
+esc_pass = ["x=\"$( \\(case x in x) \" ; ls", "x=\"$( \\(#)\" ; ls", "x=\"$(echo \\\\(case x in x) echo ;; esac)\" ; ls"]
+expect("deny", esc_deny, "escaped: ")
+expect("pass", esc_pass, "escaped: ")
 
 print("a case pattern with no \")\" is a syntax error, not a command")
 expect("pass", ["case $t in pip", "case $t in\npip", "echo $(case x in pip)"])
@@ -1096,7 +1111,8 @@ def bash_major(path):
 
 
 def runs_tool(bash, cmd):
-    r = subprocess.run([bash, "-c", STUBS + cmd], capture_output=True, text=True, timeout=10, cwd=str(PLAIN),
+    # (a generous limit: a busy machine once took over 10 s on a heredoc in ${ ...; })
+    r = subprocess.run([bash, "-c", STUBS + cmd], capture_output=True, text=True, timeout=60, cwd=str(PLAIN),
                        stdin=subprocess.DEVNULL)
     return "RAN" in r.stderr
 
@@ -1177,7 +1193,8 @@ if real51:
     for cmd in b52_deny + b52_pass:
         check(f"real bash 5.1 runs nothing in {cmd!r}", not runs_tool(real51, cmd))
 
-print("checkpoint's job_start: read as /bin/sh reads it (it runs the job), not as Claude Code's shell")
+print("checkpoint's job_start: read as /bin/sh reads it (checkpoint runs the job) and as the gateway's bash (it runs the job "
+      "while it serves the session), not as Claude Code's shell")
 JSH32, JSH52 = {"PIXI_GUARD_JOB_SH": FAKE_SHELLS["bash32"]}, {"PIXI_GUARD_JOB_SH": FAKE_SHELLS["bash53"]}
 for cmd in b32_deny[:4]:
     got = jdecision(command=cmd, **JSH32)
@@ -1195,11 +1212,38 @@ check("job argv, /bin/sh bash 3.2: sh -c code read so too",
 for cmd in b52_deny[:3]:
     got = jdecision(command=cmd, **JSH52)
     check(f"deny  job, /bin/sh bash 5.2+, Claude Code's shell zsh: {cmd[:50]!r}", got == "deny", got)
-    got = jdecision(command=cmd, **JSH, **B52)
-    check(f"pass  job, /bin/sh not bash, Claude Code's shell bash 5.2+: {cmd[:50]!r}", got == "pass", got)
+    # the gateway's bash (5.2 and later) reads it so whatever /bin/sh is
+    for label, kw in (("not bash", JSH), ("bash 3.2", JSH32)):
+        got = jdecision(command=cmd, **kw)
+        check(f"deny  job, /bin/sh {label}, read as the gateway's bash: {cmd[:50]!r}", got == "deny", got)
+for cmd in b52_pass:
+    got = jdecision(command=cmd, **JSH)
+    check(f"pass  job, /bin/sh not bash, the gateway's bash: {cmd[:50]!r}", got == "pass", got)
 r = jreason(command=b52_deny[0], **JSH52)
 check("job, /bin/sh bash 5.2+: the note says the job runs with /bin/sh", "checkpoint runs the job with /bin/sh, which here is bash 5.2" in r, r)
+r = jreason(command=b52_deny[0], **JSH)
+check("job, /bin/sh not bash: the note says the gateway runs checkpoint's jobs with its own bash",
+      "while the gateway serves the session, it runs checkpoint's jobs with its own bash, which is bash 5.2" in r
+      and "/bin/sh" not in r and "Claude Code's shell" not in r, r)
 check("job, /bin/sh bash 3.2: PIXI_GUARD=ask still asks", jdecision(command="PIXI_GUARD=ask " + b32_deny[0], **JSH32) == "ask")
+# Both at once: with /bin/sh bash 3.2, a ${ ...; } (code to the gateway's bash 5.3) also makes the text be read as bash
+# 3.2 reads it (${...} as text): there the $( ends at the ")" inside it, and the rest is code.
+job32_53 = "x=\"$(${ echo ) ; }\" ; pip install foo ; \")\""
+check("deny  job, /bin/sh bash 3.2 and the gateway's bash: a ${ ...; } in a $(...) read as bash 3.2 too",
+      jdecision(command=job32_53, **JSH32) == "deny")
+r = jreason(command=job32_53, **JSH32)
+check("job, /bin/sh bash 3.2 and a ${ ...; }: the note is /bin/sh's", "`pip`" in r and "/bin/sh, which here is bash 3.2" in r, r)
+for label, kw in (("not bash", JSH), ("bash 5.3", JSH52)):
+    got = jdecision(command=job32_53, **kw)
+    check(f"pass  job, /bin/sh {label}: {job32_53!r}", got == "pass", got)
+check(f"pass  gateway job: {job32_53!r}", verdict(*run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": "mcp__plugin_gate_gw__job_start",
+                                                          "tool_input": {"command": job32_53}})) == "pass")
+if 3 in real:
+    check(f"real bash 3.2 runs the tool in {job32_53!r}", runs_tool(real[3], job32_53))
+if 5 in real:
+    check(f"real bash 5 runs nothing in {job32_53!r}", not runs_tool(real[5], job32_53))
+if shutil.which("dash"):  # (a bad substitution: dash stops there)
+    check(f"real dash runs nothing in {job32_53!r}", not runs_tool(shutil.which("dash"), job32_53))
 # The real /bin/sh (no override): bash 3.2 on macOS, dash on Debian.
 sh_ver = bash_version("/bin/sh")
 if sh_ver[0] == 3 or sh_ver == (0, 0):
@@ -1428,6 +1472,453 @@ for label, ti, want in (
 ):
     got = verdict(*run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": GWSEND, "tool_input": {"id": "t_01", "seq": 1, **ti}}))
     check(f"{want:5} terminal, {label}", got == want, got)
+
+print("bash 5.3 and later: ${ CMD; } and ${| CMD; } run CMD (to zsh, dash and older bash, a bad substitution)")
+B53 = {"SHELL": FAKE_SHELLS["bash53"]}
+# refused when bash 5.3 or later runs them, read as before (plain text) otherwise
+b53_deny = [
+    "echo ${ python -c 1; }", "echo ${| python -c 1; }", "echo ${|python -c 1; }", "echo ${\tpython -c 1; }",
+    "echo ${\npython -c 1\n}", "echo \"${ pip install x; }\"", "x=${ python -V; }", "echo ${ python -c 1;}",
+    "echo ${ if true; then python; fi }", "echo ${ case x in x) python;; esac }", "echo ${ echo a | python; }",
+    "echo ${ ${ python; }; }", "echo ${ echo a; } ${ python; }", "echo ${ function f { python; }; f; }",
+    "echo ${ f() { python; }; f; }", "echo ${ echo $(echo }) ; python; }", "echo ${ echo `echo }`; python; }",
+    "echo ${ echo \"}\"; python; }", "echo ${x:-${ python; }}", "echo \"${x:-${ python; }}\"",
+    "cat <<EOF\n${ python; }\nEOF", "echo $(( ${ python; } + 1 ))", "echo $[ ${ python; } + 1 ]", "a=(${ python; })",
+    "[[ ${ python; } ]]", "for i in ${ python; }; do :; done", "echo hi >${ pip list; }", "echo `echo ${ python; }`",
+    "echo ${ echo a;}b${ python;}", "echo \"$(echo ${ pip list; })\"", "echo ${ (python) }",
+    "echo ${ while false; do :; done; python; }", "echo ${ [[ -n x ]] && python; }", "eval 'echo ${ pip list; }'",
+    "echo \"${ coproc c { :; }; python; }\"", "echo \"${ coproc { :; }; python; }\"",
+    # in "...": its "}" is the one where a reserved word may come (not after a word), past its groups
+    "echo \"${ echo }; python; }\"", "echo \"${ f() { :; }; python; }\"", "echo \"${ function f { :; }; python; }\"",
+    # a heredoc in it ends at a line that starts with its delimiter and has a "}" after it; the rest of
+    # that line is code
+    "echo ${ cat <<'EOF'\nEOF python; }\nEOF\n}",
+    # a "}" in a case pattern ends nothing
+    "echo \"${ case } in (}) python;; esac; }\"", "echo \"${ case x in x) echo;; (}) :;; esac; python; }\"",
+    "cat <<EOF\n${ case } in (}) python;; esac; }\nEOF", "echo \"${ case } in\n}) python;;\nesac\n}\"",
+    "echo \"${ case x in x|}) python;; esac; }\"",
+]
+# refused when bash 5.3 runs them (the rest is read as code by the other readings too)
+b53_deny_too = [
+    "echo ${ { echo a; }; python; }", "echo ${ echo a; #}\npython; }", "echo ${ echo a # }\npython\n}",
+    "echo ${ echo }; python; }", "echo ${ echo a; }}; python",
+    "echo ${ cat <<'EOF'\nEOF }\npython\nEOF\n}", "echo ${ cat <<'EOF'\nEOFx }\npython\nEOF\n}",
+    "echo ${ cat <<'EOF'\nEOF {}\npython\nEOF\n}", "echo ${ cat <<'EOF' | cat\nEOFa }\npython\nEOF\n}",
+    "echo ${ cat <<EOF\n$(python)\nEOF\n}",
+    # in "...": the heredoc ends at "EOF }", whose "}" ends it; a reserved word may come after esac
+    "echo \"${ cat <<'EOF'\nEOF }\"; python", "echo \"${ case x in x) :;; esac }\"; python",
+    "echo \"${ while false; do :; done }\"; python", "echo \"${ [[ -n x ]] }\"; python",
+]
+b53_pass = [
+    "echo ${ echo a; }", "echo ${| REPLY=python; }", "echo ${ echo a; } python", "echo ${ echo a; }python",
+    "echo ${ if true; then echo; fi }; echo after", "echo ${ [[ -n x ]] }", "echo ${ (echo a) }", "echo ${ (( 1 )) }",
+    "echo ${ case x in x) echo;; esac; }", "echo ${ echo a & }", "echo ${ cat <<'EOF'\nhello python\nEOF\n}",
+    "echo ${ cat <<'EOF'\nEOF)\npython\nEOF\n}", "cat <<'EOF'\n${ python; }\nEOF", "echo '${ python; }'",
+    "echo ${ echo a; } # ${ python; }", "echo ${ echo a; } }", "echo ${ }", "echo ${| }", "echo ${ echo pip; }",
+    "echo $( echo ${ cat <<'EOF'\nEOF )\npython\nEOF\n}; )", "echo ${ echo $( cat <<'EOF'\nEOF }\npython\nEOF\n); }",
+    "git commit -m \"${ cat <<'EOF'\nUse pixi, not pip (it's faster)\nEOF\n}\"", "echo ${ echo a\t;\t}",
+    "echo ${ time echo; }", "echo ${ ! false; }", "echo ${ echo a; } \"${ echo b; }\"", "echo ${ echo $'}'; echo python; }",
+    "echo ${ echo a; }}", "echo ${x:+${ echo python; }}", "echo ${ coproc c { echo python; }; }",
+    "echo \"${ if true; then :; fi }; python; }\"", "echo \"${ { :; } }; python; }\"", "echo \"${ echo a; }; python; }\"",
+    "echo \"${ cat <<'EOF'\nEOF }\npython\nEOF\n}\"",
+    # (a "}" or "{" in a case pattern is no reserved word)
+    "echo \"${ case } in (}) echo;; esac; }\"", "echo \"${ case x in x) :;; ({ ) :;; esac; } python\"",
+    # (a "}" right after a keyword ends it: a syntax error, nothing runs)
+    "echo \"${ if }; then python; fi; }\"", "echo \"${ if true; then }; python; fi; }\"",
+    "echo \"${ if :; then :; else }; python; fi; }\"", "echo \"${ if :; then :; elif }; then python; fi; }\"",
+    "echo \"${ while }; do python; done; }\"", "echo \"${ while :; do }; python; done; }\"",
+    "echo \"${ until }; do python; done; }\"", "echo \"${ ! }; python; }\"", "echo \"${ time }; python; }\"",
+    "echo \"${ coproc }; python; }\"", "echo \"${ function f }; python; }\"",
+    # plain ${...}: untouched
+    "echo ${VAR}", "echo ${VAR:-x}", "echo ${x:-python}", "echo \"${HOME:-/tmp}/python\"", "echo ${#x} ${x%% *}",
+]
+expect("deny", b53_deny + b53_deny_too, "bash 5.3+: ", **B53)
+expect("pass", b53_pass, "bash 5.3+: ", **B53)
+expect("deny", ["${PYTHON:-python3} x.py", "echo ${x:-$(python -V)}", "${VENV:-.venv}/bin/uvicorn app"],
+       "bash 5.3+, plain ${...} as before: ", **B53)
+# what ${ CMD; } prints into a shell's code is code, as with $(...); what ${| CMD; } prints is not its value
+expect("deny", ["bash -c \"${ cat <<'EOF'\npython x\nEOF\n}\"", "eval \"${ echo python x; }\""], "bash 5.3+: ", **B53)
+expect("pass", ["bash -c \"${| cat <<'EOF'\npython x\nEOF\n}\"", "bash -c \"${ cat <<'EOF'\nls\nEOF\n}\""], "bash 5.3+: ", **B53)
+# under pixi only an installer is refused, as in $(...)
+expect("deny", ["pixi run bash -c 'echo ${ pip install x; }'"], "bash 5.3+: ", **B53)
+expect("pass", ["pixi run bash -c 'echo ${ pip list; }'", "pixi run python ${ echo x.py; }"], "bash 5.3+: ", **B53)
+for label, kw in (("zsh", {}), ("bash 5.2", {"SHELL": FAKE_SHELLS["bash52"]}), ("bash 3.2", B32)):
+    expect("pass", b53_deny, f"{label}: ", **kw)
+for label in ("bash510", "bash60"):
+    check(f"bash 5.3+: {label} reads it so too", decision(b53_deny[0], SHELL=FAKE_SHELLS[label]) == "deny")
+check("bash 5.3+: CLAUDE_CODE_SHELL counts over SHELL",
+      decision(b53_deny[0], SHELL=FAKE_SHELLS["bash52"], CLAUDE_CODE_SHELL=FAKE_SHELLS["bash53"]) == "deny")
+check("bash 5.3+: the refusal names the program", hit(b53_deny[0], **B53) == "python")
+check("bash 5.3+: PIXI_GUARD=ask still asks", decision("PIXI_GUARD=ask " + b53_deny[0], **B53) == "ask")
+for cmd in b53_deny[:3]:
+    got = jdecision(command=cmd, PIXI_GUARD_JOB_SH=FAKE_SHELLS["bash53"])
+    check(f"deny  job, /bin/sh bash 5.3+, Claude Code's shell zsh: {cmd!r}", got == "deny", got)
+    # a checkpoint job is read as the gateway's bash too (it runs the job while it serves the session)
+    for label, kw in (("bash 5.2", {"PIXI_GUARD_JOB_SH": FAKE_SHELLS["bash52"]}), ("not bash", JSH), ("bash 3.2", JSH32)):
+        got = jdecision(command=cmd, **kw)
+        check(f"deny  job, /bin/sh {label}, read as the gateway's bash 5.3: {cmd!r}", got == "deny", got)
+    # the gateway's bash (5.2 today, any version its pixi.toml gets): read as 5.3 too
+    check(f"deny  gateway job, its own bash, Claude Code's shell zsh: {cmd!r}", gwdecision(command=cmd) == "deny")
+    check(f"deny  terminal, the gateway's bash: {cmd!r}", sdecision(cmd + "\n") == "deny")
+check("pass  gateway job: ${ CMD; } with nothing to refuse", gwdecision(command=b53_pass[0]) == "pass")
+# ... and as 5.2, where ${ ... } is a bad substitution up to its first "}" (a bare "{" does not nest, as it
+# does in zsh): bash 5.2 drops the rest of that line and runs the next ones, even what 5.3 reads as a heredoc.
+gw52_deny = [
+    "echo ${ cat <<'EOF'\n}\npython x.py\nEOF\n}", "echo ${ cat <<EOF\n}\npython x.py\nEOF\n}",
+    "x=${ cat <<'EOF'\nsome } text\npip install x\nEOF\n}", "echo ${ cat <<'EOF'\n{ }\npython x.py\nEOF\n}",
+    # (a heredoc in $(...) ending at a line that starts with "EOF" and has a ")" after it, as bash 5.2 ends it)
+    "echo ${ cat <<'X'\n}\necho $(cat <<EOF\nEOF :); python\nEOF\n)\nX\n}",
+    "echo ${ cat <<'X'\n}\necho \"$(cat <<'EOF'\nEOFError :) `python -V`\nEOF\n)\"\nX\n}",
+]
+gw52_pass = [
+    "echo ${ echo hi; }", "echo \"${ date; }\"", "x=${| REPLY=hello; }; echo $x", "echo ${ cat <<'EOF'\npip install x\nEOF\n}",
+    "echo \"${ cat <<'EOF'\n{ }\npython x.py\nEOF\n}\"", "git commit -m \"${ cat <<'EOF'\nUse pixi, not pip (it's faster)\nEOF\n}\"",
+]
+for cmd in gw52_deny:
+    check(f"deny  gateway job, read as bash 5.2 too: {cmd!r}", gwdecision(command=cmd) == "deny")
+    check(f"deny  terminal, read as bash 5.2 too: {cmd!r}", sdecision(cmd + "\n") == "deny")
+    check(f"deny  checkpoint job, /bin/sh not bash, read as the gateway's bash 5.2: {cmd!r}", jdecision(command=cmd, **JSH) == "deny")
+expect("pass", gw52_deny, "bash 5.3+ as Claude Code's shell (no 5.2 reading): ", **B53)
+for cmd in gw52_pass:
+    check(f"pass  gateway job: {cmd!r}", gwdecision(command=cmd) == "pass")
+    check(f"pass  checkpoint job, /bin/sh not bash: {cmd!r}", jdecision(command=cmd, **JSH) == "pass")
+    check(f"pass  terminal: {cmd!r}", sdecision(cmd + "\n") == "pass")
+r = gwreason(command=gw52_deny[0])
+check("gateway job read as bash 5.2: the refusal names the program and says why",
+      "`python`" in r and "bash 5.2 has no `${ CMD; }`" in r, r)
+r = jreason(command=gw52_deny[0], **JSH)
+check("checkpoint job read as the gateway's bash 5.2: the note says the gateway runs it",
+      "while the gateway serves the session, it runs checkpoint's jobs with its own bash, which is bash 5.2 or later, and bash 5.2 has no"
+      in r and "/bin/sh" not in r, r)
+# Real shells, when here: the usual places, and PIXI_GUARD_TEST_BASH (paths separated by ":").
+REAL_BASH = [p for p in ("/bin/bash", shutil.which("bash"), "/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/opt/local/bin/bash",
+                         *os.environ.get("PIXI_GUARD_TEST_BASH", "").split(os.pathsep)) if p and os.path.exists(p)]
+real53 = next((p for p in REAL_BASH if bash_version(p) >= (5, 3)), None)
+real52 = next((p for p in REAL_BASH if bash_version(p) == (5, 2)), None)
+older = [p for p in REAL_BASH if (0, 0) < bash_version(p) < (5, 3)]
+if real53:
+    for cmd in b53_deny + b53_deny_too:
+        check(f"real bash 5.3+ runs the tool in {cmd!r}", runs_tool(real53, cmd))
+    for cmd in b53_pass + gw52_deny + gw52_pass:
+        check(f"real bash 5.3+ runs nothing in {cmd!r}", not runs_tool(real53, cmd))
+for v, p in sorted({bash_version(p): p for p in reversed(older)}.items()):  # (one of each version)
+    for cmd in b53_deny:
+        check(f"real bash {'.'.join(map(str, v))} runs nothing in {cmd!r}", not runs_tool(p, cmd))
+if real52:
+    for cmd in gw52_deny:
+        check(f"real bash 5.2 runs the tool in {cmd!r}", runs_tool(real52, cmd))
+    for cmd in gw52_pass:
+        check(f"real bash 5.2 runs nothing in {cmd!r}", not runs_tool(real52, cmd))
+
+print("a shell prefix (CLAUDE_CODE_SHELL_PREFIX, the gateway's gate-sh): while the gateway's managed shell isn't ready, it runs "
+      "the command in the shell that made its snapshot, found the way Claude Code finds its shell: CLAUDE_CODE_SHELL, then SHELL "
+      "(when in the environment), then the preferred shell on PATH, in /bin, /usr/bin, /usr/local/bin, /opt/homebrew/bin, the "
+      "other there, the other on PATH (bash preferred when SHELL holds \"bash\", else zsh); the first executable bash or zsh by "
+      "its absolute path. Never /bin/sh. Once ready, in the gateway's bash")
+PFX = {"CLAUDE_CODE_SHELL_PREFIX": "/x/hooks/gate-sh"}
+D32, D53 = str(Path(FAKE_SHELLS["bash32"]).parent), str(Path(FAKE_SHELLS["bash53"]).parent)
+# (a zsh here on every machine; a versioned bash 5.3 and zsh, a zsh and a bash 3.2 that aren't executable, a bash 3.2 whose
+# name holds "bash" without starting with it, a bash 5.3 in a folder whose name holds "=", a folder named bash)
+for d, name, text in (("zsh", "zsh", "zsh 5.9 (x86_64-apple-darwin24.0)"), ("vbash", "bash5", "GNU bash, version 5.3.15(1)-release"),
+                      ("vzsh", "zsh-5.9", "zsh 5.9 (x86_64-apple-darwin24.0)"), ("noxzsh", "zsh", "zsh 5.9"),
+                      ("noxbash", "bash", "GNU bash, version 3.2.57(1)-release"), ("gnu32", "gnubash", "GNU bash, version 3.2.57(1)-release"),
+                      ("eq=53", "bash", "GNU bash, version 5.3.15(1)-release")):
+    (TMP / d).mkdir()
+    (TMP / d / name).write_text(f'#!/bin/sh\necho "{text}"\n')
+    (TMP / d / name).chmod(0o644 if d.startswith("nox") else 0o755)
+(TMP / "dirbash" / "bash").mkdir(parents=True)
+(TMP / "noshells").mkdir()
+ZSH, DZ, VBASH, VZSH, GNU32 = (str(TMP / "zsh" / "zsh"), str(TMP / "zsh"), str(TMP / "vbash" / "bash5"), str(TMP / "vzsh" / "zsh-5.9"),
+                               str(TMP / "gnu32" / "gnubash"))
+EQ53, FISH = str(TMP / "eq=53" / "bash"), "/usr/local/bin/fish"
+# (SHELL is a sh that is bash 3.2, as macOS's /bin/sh is)
+(TMP / "sh32").mkdir()
+(TMP / "sh32" / "sh").write_text('#!/bin/sh\necho "GNU bash, version 3.2.57(1)-release (arm64-apple-darwin25)"\n')
+(TMP / "sh32" / "sh").chmod(0o755)
+SH32 = str(TMP / "sh32" / "sh")
+# (a relative PATH entry, from the folder the hook runs in, whose bash is 5.3)
+REL53 = os.path.relpath(D53)
+
+
+def path_without(*names):
+    """A PATH of one folder that links every program on BASE_PATH (the first of each name) but names."""
+    d = TMP / ("path-without-" + "-".join(names))
+    d.mkdir()
+    for p in BASE_PATH.split(os.pathsep):
+        try:
+            entries = sorted(os.listdir(p))
+        except OSError:
+            continue
+        for n in entries:
+            f = os.path.join(p, n)
+            if n not in names and not os.path.lexists(d / n) and os.path.isfile(f) and os.access(f, os.X_OK):
+                (d / n).symlink_to(f)
+    return str(d)
+
+
+# (NOSH: a PATH without bash or zsh; NOSHELLS: none in the places either. PIXI_GUARD_SHELL_DIRS replaces the places,
+# ":" between them; FB32, FB53: one folder, whose bash is 3.2 or 5.3, and no bash or zsh on PATH)
+NOSH = path_without("bash", "zsh")
+NOSHELLS = {"PIXI_GUARD_SHELL_DIRS": str(TMP / "noshells"), "PATH": NOSH}
+FB32, FB53 = {"PIXI_GUARD_SHELL_DIRS": D32, "PATH": NOSH}, {"PIXI_GUARD_SHELL_DIRS": D53, "PATH": NOSH}
+
+
+def gate_fallback(e, places, family=""):
+    """gate-sh's not-ready shell (its gw_fallback_shell, the gateway's managed.fallback_shell) for a snapshot made by
+    `family` ("": none): CLAUDE_CODE_SHELL, then SHELL, then the preferred shell on PATH, in the places, the other there,
+    the other on PATH; the first that is an absolute path without "=" to an executable file holding zsh (a zsh) or bash
+    (a bash), of that family."""
+    def fam(p):
+        return "zsh" if "zsh" in p else "bash" if "bash" in p else ""
+
+    def fits(p):
+        return (p.startswith("/") and "=" not in p and fam(p) != "" and family in ("", fam(p))
+                and os.path.isfile(p) and os.access(p, os.X_OK))
+    path = [d for d in e.get("PATH", "").split(":") if d.startswith("/") and "=" not in d]
+
+    def which(n):
+        p = next((f"{d}/{n}" for d in path if os.path.isfile(f"{d}/{n}") and os.access(f"{d}/{n}", os.X_OK)), None)
+        return p if p and fits(p) else None
+
+    def where(n):
+        return next((f"{d}/{n}" for d in places if fits(f"{d}/{n}")), None)
+    a, b = ("bash", "zsh") if "bash" in e.get("SHELL", "") else ("zsh", "bash")
+    for c in (e.get("CLAUDE_CODE_SHELL", ""), e.get("SHELL", "")):
+        if fits(c):
+            return c
+    return which(a) or where(a) or where(b) or which(b)
+
+
+def prefix_want(**kw):
+    """The decision on b32_deny[0] behind the prefix: deny when a bash 3.x may run it. That is Claude Code's shell as
+    bashver() reads it (CLAUDE_CODE_SHELL, else SHELL, named bash*), or gate-sh's not-ready shell with no snapshot, with
+    one Claude Code made in this environment (its rule is gate-sh's without a snapshot), or with one made by a
+    CLAUDE_CODE_SHELL that isn't there now. (Rows without SHELL set CLAUDE_CODE_SHELL to a fish, so that bashver()
+    doesn't ask the SHELL bash as sh sets itself.)"""
+    e = env(True, **kw)
+    places = [d for d in e.get("PIXI_GUARD_SHELL_DIRS", "").split(":") if d]
+    shells = {gate_fallback(e, places)}
+    ccs = e.get("CLAUDE_CODE_SHELL", "")
+    for family in {"zsh" if "zsh" in p else "bash" for p in shells | {ccs} if p and ("bash" in p or "zsh" in p)}:
+        shells.add(gate_fallback(e, places, family))
+    cc = ccs or e.get("SHELL", "")
+    if os.path.basename(cc).startswith("bash"):
+        shells.add(cc)
+    return "deny" if any(s and "zsh" not in s and bash_major(s) == 3 for s in shells) else "pass"
+
+
+# Not taken (not bash or zsh, relative, missing, not executable, holding "=", a sh that is bash 3.2): the first bash found
+for label, shell in (("not bash or zsh", str(FAKE_PIXI)), ("sh", "/bin/sh"), ("fish", FISH), ("empty", ""),
+                     ("a zsh that isn't executable", str(TMP / "noxzsh" / "zsh")), ("a sh that is bash 3.2", SH32),
+                     ("bash by a relative name", "bash"), ("a bash that isn't there", "/nowhere/bash"),
+                     ("a bash 5.3 in a folder holding '='", EQ53)):
+    for cmd in b32_deny[:3]:
+        got = decision(cmd, SHELL=shell, **PFX, **FB32)
+        check(f"deny  prefix, SHELL {label}, the first bash found bash 3.2: {cmd[:40]!r}", got == "deny", got)
+        got = decision(cmd, SHELL=shell, **FB32)
+        check(f"pass  no prefix, SHELL {label}, the first bash found bash 3.2 (not asked): {cmd[:40]!r}", got == "pass", got)
+    got = decision(b32_deny[0], SHELL=shell, **PFX, **FB53)
+    check(f"pass  prefix, SHELL {label}, the first bash found bash 5.3 (never /bin/sh): {b32_deny[0][:40]!r}", got == "pass", got)
+for cmd in b32_pass[:3]:
+    got = decision(cmd, SHELL=str(FAKE_PIXI), **PFX, **FB32)
+    check(f"pass  prefix, SHELL not bash or zsh, the first bash found bash 3.2: {cmd[:40]!r}", got == "pass", got)
+for cmd in b52_deny[:2] + b53_deny[:2]:
+    got = decision(cmd, SHELL=str(FAKE_PIXI), **PFX, **FB53)
+    check(f"deny  prefix, SHELL not bash or zsh, the first bash found bash 5.3: {cmd[:40]!r}", got == "deny", got)
+# Which shell, row by row; prefix_want() (gate-sh's rule, in Python) agrees with each. None found: gate-sh refuses the
+# command (126), so only the gateway's bash runs it.
+NOCC, CC, GONE = {"CLAUDE_CODE_SHELL": "/nowhere/fish"}, "CLAUDE_CODE_SHELL", "/nowhere/bash"
+
+
+def at(places, *path):
+    """The places (":" between them), and a PATH of the folders given, then NOSH."""
+    return {"PIXI_GUARD_SHELL_DIRS": places, "PATH": ":".join([*path, NOSH])}
+
+
+for label, kw, want in (
+        # CLAUDE_CODE_SHELL, then SHELL
+        ("SHELL zsh", {"SHELL": ZSH, **FB32}, "pass"),
+        ("SHELL bash 5.2", {"SHELL": FAKE_SHELLS["bash52"], **FB32}, "pass"),
+        ("SHELL bash 3.2", {**B32, **FB53}, "deny"),
+        ("CLAUDE_CODE_SHELL bash 5.2", {CC: FAKE_SHELLS["bash52"], "SHELL": str(FAKE_PIXI), **FB32}, "pass"),
+        ("CLAUDE_CODE_SHELL bash 5.2 (the gateway's), SHELL bash 3.2", {CC: FAKE_SHELLS["bash52"], **B32, **FB32}, "pass"),
+        ("CLAUDE_CODE_SHELL zsh, SHELL bash 3.2", {CC: ZSH, **B32, **FB32}, "pass"),
+        ("CLAUDE_CODE_SHELL zsh by a relative name, SHELL bash 3.2", {CC: "zsh", **B32, **FB53}, "deny"),
+        ("CLAUDE_CODE_SHELL a bash that isn't there, SHELL bash 3.2", {CC: GONE, **B32, **FB53}, "deny"),
+        ("CLAUDE_CODE_SHELL a bash 5.3 in a folder holding '=', SHELL bash 3.2", {CC: EQ53, **B32, **FB53}, "deny"),
+        # any path holding the shell's name (Claude Code's rule)
+        ("SHELL a versioned bash name (a bash 5.3)", {"SHELL": VBASH, **FB32}, "pass"),
+        ("SHELL a versioned zsh name", {"SHELL": VZSH, **FB32}, "pass"),
+        ("CLAUDE_CODE_SHELL a versioned bash name (a bash 5.3), SHELL bash 3.2", {CC: VBASH, **B32, **FB53}, "pass"),
+        ("CLAUDE_CODE_SHELL a bash 3.2 named gnubash (bashver doesn't ask it)", {CC: GNU32, "SHELL": ZSH, **FB53}, "deny"),
+        # SHELL only when it is in the environment: bash as sh (macOS's /bin/sh) sets one itself, the login shell
+        ("SHELL not in the environment, bash 3.2 in the places", {"SHELL": None, **NOCC, **FB32}, "deny"),
+        ("SHELL not in the environment, a zsh on PATH, bash 3.2 in the places", {"SHELL": None, **NOCC, **at(D32, DZ)}, "pass"),
+        # the preferred shell (bash when SHELL holds "bash", else zsh) on PATH, in the places, the other there, the other
+        # on PATH
+        ("SHELL fish, a zsh on PATH, bash 3.2 in the places", {"SHELL": FISH, **at(D32, DZ)}, "pass"),
+        ("SHELL fish, a zsh then bash 3.2 in the places", {"SHELL": FISH, **at(f"{DZ}:{D32}")}, "pass"),
+        ("SHELL fish, bash 5.3 then bash 3.2 in the places", {"SHELL": FISH, **at(f"{D53}:{D32}")}, "pass"),
+        ("SHELL fish, bash 3.2 then bash 5.3 in the places", {"SHELL": FISH, **at(f"{D32}:{D53}")}, "deny"),
+        ("SHELL fish, bash 5.3 in the places, bash 3.2 on PATH", {"SHELL": FISH, **at(D53, D32)}, "pass"),
+        ("SHELL empty, no places, bash 3.2 on PATH", {"SHELL": "", **at("", D32)}, "deny"),
+        ("SHELL empty, no places, bash 5.3 on PATH", {"SHELL": "", **at("", D53)}, "pass"),
+        ("SHELL a bash that isn't there, bash 5.3 in the places, bash 3.2 on PATH", {"SHELL": GONE, **at(D53, D32)}, "deny"),
+        ("SHELL a bash that isn't there, bash 3.2 in the places, bash 5.3 on PATH", {"SHELL": GONE, **at(D32, D53)}, "pass"),
+        ("SHELL a bash that isn't there, a zsh then bash 3.2 in the places", {"SHELL": GONE, **at(f"{DZ}:{D32}")}, "deny"),
+        ("SHELL fish, only a zsh, in the places", {"SHELL": FISH, **at(DZ)}, "pass"),
+        ("SHELL fish, only a zsh, on PATH", {"SHELL": FISH, **at(str(TMP / "noshells"), DZ)}, "pass"),
+        ("SHELL fish, no bash or zsh anywhere", {"SHELL": FISH, **NOSHELLS}, "pass"),
+        # on PATH: absolute folders without "=", an executable file
+        ("SHELL fish, a relative PATH entry with bash 5.3, then bash 3.2", {"SHELL": FISH, **at("", REL53, D32)}, "deny"),
+        ("SHELL fish, a bash that isn't executable on PATH, then bash 3.2",
+         {"SHELL": FISH, **at("", str(TMP / "noxbash"), D32)}, "deny"),
+        ("SHELL fish, a folder named bash on PATH, then bash 3.2", {"SHELL": FISH, **at("", str(TMP / "dirbash"), D32)}, "deny"),
+        ("SHELL fish, a bash 5.3 in a folder holding '=' on PATH, then bash 3.2",
+         {"SHELL": FISH, **at("", str(TMP / "eq=53"), D32)}, "deny"),
+        # a CLAUDE_CODE_SHELL bash that isn't there now (the gateway's, during a rebuild) may have made the snapshot: gate-sh
+        # then runs the first bash; one that names a zsh changes nothing (a zsh is read anyway)
+        ("CLAUDE_CODE_SHELL a bash that isn't there, SHELL zsh, bash 3.2 in the places", {CC: GONE, "SHELL": ZSH, **at(D32, DZ)}, "deny"),
+        ("CLAUDE_CODE_SHELL a bash that isn't there, SHELL zsh, bash 5.3 in the places", {CC: GONE, "SHELL": ZSH, **at(D53, DZ)}, "pass"),
+        ("CLAUDE_CODE_SHELL a zsh that isn't there, SHELL zsh, bash 3.2 in the places",
+         {CC: "/nowhere/zsh", "SHELL": ZSH, **at(D32, DZ)}, "pass")):
+    got, model = decision(b32_deny[0], **kw, **PFX), prefix_want(**kw)
+    check(f"{want:5} prefix, {label}: {b32_deny[0][:40]!r}", got == want == model, f"got {got}, gate-sh's rule {model}")
+for cmd in b52_deny[:1] + b53_deny[:1] + gw52_deny[:1]:
+    got = decision(cmd, SHELL="", **PFX, **NOSHELLS)
+    check(f"deny  prefix, no bash or zsh anywhere: still read as the gateway's bash: {cmd[:40]!r}", got == "deny", got)
+for label, ccs in (("zsh by a relative name", "zsh"), ("a bash that isn't there", "/nowhere/bash")):
+    got = decision(b32_deny[0], CLAUDE_CODE_SHELL=ccs, **B32, **FB53)
+    check(f"pass  no prefix, CLAUDE_CODE_SHELL {label}, SHELL bash 3.2: Claude Code's shell", got == "pass", got)
+r = reason(b32_deny[0], SHELL=str(FAKE_PIXI), **PFX, **FB32)
+check("prefix, the first bash found bash 3.2: the note says the gateway's not-ready shell runs it with that bash",
+      f"while the gateway's managed shell isn't ready it runs them with {FAKE_SHELLS['bash32']}, which here is bash 3.2 "
+      "(the version of macOS's /bin/bash)" in r and "git commit -F" in r and "/bin/sh" not in r, r)
+r = reason(b32_deny[0], SHELL="", **PFX, PIXI_GUARD_SHELL_DIRS="", PATH=f"{D32}:{NOSH}")
+check("prefix, bash 3.2 found on PATH: the note names it",
+      f"while the gateway's managed shell isn't ready it runs them with {FAKE_SHELLS['bash32']}, which here is bash 3.2" in r, r)
+r = reason(b32_deny[0], CLAUDE_CODE_SHELL="zsh", **B32, **PFX, **FB53)
+check("prefix, SHELL bash 3.2 that isn't Claude Code's shell: the note names it",
+      f"while the gateway's managed shell isn't ready it runs them with {FAKE_SHELLS['bash32']}, which here is bash 3.2" in r, r)
+# ... and once ready (its build may finish during the session), in the gateway's own bash, whatever CLAUDE_CODE_SHELL is:
+# read as for a gateway job
+for cmd in b52_deny[:2] + b53_deny[:2] + gw52_deny[:2]:
+    for label, kw in (("SHELL zsh", {"SHELL": ZSH}), ("SHELL not bash or zsh, the first bash found bash 3.2", {"SHELL": str(FAKE_PIXI), **FB32}),
+                      ("CLAUDE_CODE_SHELL zsh", {"CLAUDE_CODE_SHELL": ZSH}), ("CLAUDE_CODE_SHELL bash 5.1", {"CLAUDE_CODE_SHELL": FAKE_SHELLS["bash51"]}),
+                      ("CLAUDE_CODE_SHELL bash 5.3", {"CLAUDE_CODE_SHELL": FAKE_SHELLS["bash53"]})):
+        got = decision(cmd, **kw, **PFX)
+        check(f"deny  prefix, {label}: read as the gateway's bash too: {cmd[:40]!r}", got == "deny", got)
+    # (gw52_deny: only bash 5.3 alone reads those as harmless, see above)
+    for label, kw in (("no prefix, SHELL zsh", {"SHELL": ZSH}), ("no prefix, CLAUDE_CODE_SHELL bash 5.1", {"CLAUDE_CODE_SHELL": FAKE_SHELLS["bash51"]})) \
+            if cmd not in gw52_deny else (("no prefix, CLAUDE_CODE_SHELL bash 5.3", {"CLAUDE_CODE_SHELL": FAKE_SHELLS["bash53"]}),):
+        got = decision(cmd, **kw)
+        check(f"pass  {label}: {cmd[:40]!r}", got == "pass", got)
+for cmd in b52_pass + gw52_pass:
+    got = decision(cmd, SHELL=ZSH, **PFX)
+    check(f"pass  prefix, SHELL zsh: {cmd[:40]!r}", got == "pass", got)
+r = reason(b52_deny[0], SHELL=ZSH, **PFX)
+check("prefix, the gateway's bash: the note says the managed shell runs it there once ready",
+      "once the gateway's managed shell is ready it runs them with the gateway's own bash, which is bash 5.2" in r, r)
+r = reason(b52_deny[0], SHELL=FAKE_SHELLS["bash53"], **PFX)
+check("prefix, SHELL bash 5.3: the note is Claude Code's shell's", "Claude Code's shell here is bash 5.2" in r, r)
+check(f"deny  prefix, SHELL bash 3.2: {job32_53!r} read as bash 3.2 too", decision(job32_53, **B32, **PFX) == "deny")
+check(f"pass  prefix, SHELL zsh: {job32_53!r}", decision(job32_53, SHELL=ZSH, **PFX) == "pass")
+check("prefix: a job is read as before (checkpoint's /bin/sh, the gateway's bash)",
+      jdecision(command=b32_deny[0], SHELL=str(FAKE_PIXI), **PFX, **FB32, **JSH) == "pass"
+      and gwdecision(command=b32_deny[0], SHELL=str(FAKE_PIXI), **PFX, **FB32) == "pass")
+# The real places and PATH (no override): whatever this machine has (/bin/zsh and macOS's /bin/bash 3.2; a bash 5 on Linux).
+for label, shell in (("not bash or zsh (zsh preferred)", str(FAKE_PIXI)), ("a bash that isn't there (bash preferred)", "/nowhere/bash")):
+    want = prefix_want(SHELL=shell, PIXI_GUARD_SHELL_DIRS="/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin")
+    got = decision(b32_deny[0], SHELL=shell, **PFX)
+    check(f"{want:5} prefix, SHELL {label}, this machine's shells", got == want, got)
+check("prefix: the usual places are Claude Code's (and gate-sh's): /bin, /usr/bin, /usr/local/bin, /opt/homebrew/bin",
+      "${PIXI_GUARD_SHELL_DIRS-/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin}" in GUARD.read_text())
+# Budgets: the look-ahead for the "}" is one pass, nested ones count as in $(...) (200 deep at most). A
+# gateway job reads the text again as bash 5.2 (view 5), which finds 30 nested "${x:-'$(...)'}" too deep,
+# as it did before bash 5.3 was read. A checkpoint job with /bin/sh bash 3.2 (macOS's) and a command behind a
+# prefix whose not-ready shell may be bash 3.2 are read as bash 3.2 too (view 3), and as zsh and dash where they
+# end a ${ ...} elsewhere: four readings of 120KB or more are over the parse budget (b32want), as zsh's
+# nesting of each bare "{" asks for one more.
+for label, cmd, want, gwwant, b32want in (
+    ("${ x60000, unclosed", "echo " + "${ " * 60000 + "\nls", "too large", "too large", "too large"),
+    ("${| x60000, unclosed", "echo " + "${|" * 60000 + "\nls", "too large", "too large", "too large"),
+    ("${ x30000, closed", "echo " + "${ " * 30000 + "; }" * 30000 + "; ls", "too large", "too large", "too large"),
+    ("\"${ x40000, unclosed", 'echo "' + "${ \"" * 40000 + "\nls", "too large", "too large", "too large"),
+    ("${x:-${ x30000", "echo " + "${x:-${ " * 30000 + "; }}" * 30000 + "; ls", "too large", "too large", "too large"),
+    ("nested ${x:-{${ x30", "echo " + "${x:-{${ :; " * 30 + "}}" * 30 + "; ls", "too large", "too large", "too large"),
+    ("$( x60000 in ${ ...", "echo ${ " + "$( " * 60000 + "; }", "too large", "too large", "too large"),
+    ("nested \"${x:-'$(: \"${ x30", 'echo "' + "${x:-'$(: \"${ :; " * 30 + "x; })'}\"" * 30 + "; ls", "pass", "too large", "too large"),
+    ("{ x60000 in ${ ...", "echo ${ " + "{ " * 60000 + "; }", "pass", "pass", "too large"),
+    ("f() x30000 in ${ ...", "echo ${ " + "f() " * 30000 + "; }", "pass", "pass", "pass"),
+    ("fi x40000 in ${ ...", "echo ${ " + "fi " * 40000 + "}", "pass", "pass", "pass"),
+    ("a } x40000 in ${ ...", "echo ${ " + "a } " * 40000 + "; }", "pass", "pass", "too large"),
+    ("a } x20000 in ${ ...", "echo ${ " + "a } " * 20000 + "; }", "pass", "pass", "pass"),
+    ("${ a; } x20000", "echo " + "${ a; }" * 20000 + "; ls", "pass", "pass", "pass"),
+    ("${ a; } x20000, then pip", "echo " + "${ a; }" * 20000 + "; pip list", "`pip`", "`pip`", "`pip`"),
+    ("${ cat <<'E'\\n}\\nE\\n} x8000", "echo " + "${ cat <<'E'\n}\nE\n}\n" * 8000 + "ls", "pass", "pass", "too large"),
+    ("${ cat <<'E'\\n}\\nE\\n} x4000", "echo " + "${ cat <<'E'\n}\nE\n}\n" * 4000 + "ls", "pass", "pass", "pass"),
+):
+    r, cpu, wall = budgeted(reason, cmd, wall=6, **B53)
+    check(f"bash 5.3+: {label} ({len(cmd) // 1000}KB): {want}, {cpu:.2f}s CPU, {wall:.2f}s",
+          (r == "" if want == "pass" else want in r) and cpu < CPU and wall < 6, r[:80])
+    r, cpu, wall = budgeted(gwreason, command=cmd, wall=6)
+    check(f"gateway job: {label} ({len(cmd) // 1000}KB): {gwwant}, {cpu:.2f}s CPU, {wall:.2f}s",
+          (r == "" if gwwant == "pass" else gwwant in r) and cpu < CPU and wall < 6, r[:80])
+    for setup, fn in (("checkpoint job, /bin/sh bash 3.2", lambda: jreason(command=cmd, **JSH32)),
+                      ("prefix, the first bash found bash 3.2", lambda: reason(cmd, SHELL=str(FAKE_PIXI), **PFX, **FB32))):
+        r, cpu, wall = budgeted(fn, wall=6)
+        check(f"{setup}: {label} ({len(cmd) // 1000}KB): {b32want}, {cpu:.2f}s CPU, {wall:.2f}s",
+              (r == "" if b32want == "pass" else b32want in r) and cpu < CPU and wall < 6, r[:80])
+
+print("a checkpoint job may run in dash or zsh too, and a command behind a shell prefix in zsh, to which a ${ ...; } is a "
+      "parameter expansion: where they end it elsewhere than bash does, the text is read their way as well")
+# (real dash or zsh runs the tool in each; no bash does, see below)
+zd_deny = [
+    "x=$(: \"${ '}'\" )\npip list\n'}'", "echo $(: \"${ '{}\"\\}; )\npip list", "echo \"$(: \"${ '{}\"\\}; )\"\npip list",
+    "echo $(: \"${ '{}\"\\};  )\npip list\nE\n}", "( : \"${ x:-'}'\" )\npip list\n'\n}", "( : \"${| '}'\" ) ; pip list ; '}'",
+]
+zd_pass = [
+    # the same, nothing to refuse
+    "x=$(: \"${ '}'\" )\nls\n'}'", "echo $(: \"${ '{}\"\\}; )\nls", "( : \"${ x:-'}'\" )\nls\n'\n}",
+    # where they end it as bash does
+    "x=$(: \"${ echo a; }\" )\nls", "echo \"${ echo '}'; }\"", "echo ${ a; } ; ls", "echo \"${ cat <<'EOF'\n{ }\nok\nEOF\n}\"",
+]
+for label, fn in (("checkpoint job, /bin/sh not bash", lambda c: jdecision(command=c, **JSH)),
+                  ("checkpoint job, /bin/sh bash 3.2", lambda c: jdecision(command=c, **JSH32)),
+                  ("prefix, SHELL zsh", lambda c: decision(c, SHELL=ZSH, **PFX)),
+                  ("prefix, SHELL not bash or zsh, only a zsh found",
+                   lambda c: decision(c, SHELL=str(FAKE_PIXI), **PFX, PIXI_GUARD_SHELL_DIRS=DZ, PATH=NOSHELLS["PATH"]))):
+    for cmd in zd_deny:
+        got = fn(cmd)
+        check(f"deny  {label}: {cmd!r}", got == "deny", got)
+    for cmd in zd_pass:
+        got = fn(cmd)
+        check(f"pass  {label}: {cmd!r}", got == "pass", got)
+# Only bash runs them: no zsh or dash reading.
+for label, fn in (("bash 5.3 as Claude Code's shell", lambda c: decision(c, **B53)), ("gateway job", lambda c: gwdecision(command=c)),
+                  ("terminal", lambda c: sdecision(c + "\n"))):
+    for cmd in zd_deny:
+        got = fn(cmd)
+        check(f"pass  {label}: {cmd!r}", got == "pass", got)
+check("deny  checkpoint job, /bin/sh not bash: the refusal names the program", jreason(command=zd_deny[0], **JSH).startswith(
+    "pixi-guard: refused, `pip` would run"), jreason(command=zd_deny[0], **JSH))
+real_zd = [p for p in (shutil.which("dash"), "/bin/zsh", shutil.which("zsh")) if p and os.path.exists(p)]
+for cmd in zd_deny if real_zd else ():
+    ran = [p for p in real_zd if runs_tool(p, cmd)]
+    check(f"real dash or zsh runs the tool in {cmd!r}", ran, real_zd)
+for cmd in zd_pass:
+    for p in real_zd:
+        check(f"real {p} runs nothing in {cmd!r}", not runs_tool(p, cmd))
+for p in REAL_BASH:
+    for cmd in zd_deny:
+        check(f"real bash {'.'.join(map(str, bash_version(p)))} ({p}) runs nothing in {cmd!r}", not runs_tool(p, cmd))
+# (the escaped words above: every shell runs the tool after the ")", and nothing in the near misses)
+for p in REAL_BASH + real_zd:
+    for cmd in esc_deny:
+        check(f"real {p} runs the tool in {cmd!r}", runs_tool(p, cmd))
+    for cmd in esc_pass:
+        check(f"real {p} runs nothing in {cmd!r}", not runs_tool(p, cmd))
+
 # aliases: an interactive bash expands them, so the value is code (alias X=python, then X)
 for text, want in (("alias p=python\np x.py\n", "deny"), ("alias p=python; p x.py\n", "deny"), ("alias p='pip install'\n", "deny"),
                    ("alias ll='ls -l'\nll\n", "pass"), ("alias p='pixi run python'\np x.py\n", "pass"), ("alias\n", "pass")):
@@ -1513,7 +2004,7 @@ expect("pass", [
     "pixi exec --spec pip pip list", "pixi exec -s install python x.py", "pixi add --pypi requests", "pixi add pip",
     "pixi install", "pixi global install pip", "pixi run 'pip list && pytest'", "pixi run python x.py install",
 ])
-# What pixi runs is read by the scanner in pixi mode: one word is a shell line to pixi (pixi 0.81 runs
+# What pixi runs is read by the scanner in pixi mode: one word is a shell line to pixi (pixi runs
 # `pixi run 'a && b'` as both, and `pixi run echo 'a; b'` as echo with one argument), wrappers and options
 # are skipped as anywhere, and only an installer is refused.
 expect("deny", [
@@ -1789,16 +2280,21 @@ check("pixi global: PIXI_GUARD=ask still asks for one elsewhere",
 check("a non-pixi copy first on PATH: the refusal names it",
       hit("mkdocs build", HOME=str(gh), PATH=os.pathsep.join([str(other), str(gbin), BASE_PATH])) == "mkdocs")
 
-print("the gateway's jobs and terminals: a bare name is looked up in the gateway's own PATH, not the hook's, so it is refused")
-# The gateway runs them with its folders, gateway.toml's import_path, then /usr/bin:/bin:/usr/sbin:/sbin.
+print("the gateway's jobs and terminals, and checkpoint's jobs: a bare name is looked up on the hook's PATH (Claude Code's, which they get too)")
+# The gateway gives its jobs and terminals Claude Code's PATH (its stand-ins first), and a checkpoint job it runs
+# checkpoint's environment.
+NOTPX = {"HOME": str(gh), "PATH": os.pathsep.join([str(other), str(gbin), BASE_PATH])}  # a non-pixi copy first
 for cmd in ("python3 -V", "pytest -q", "mkdocs build", "env FOO=1 black ."):
     check(f"pass  Bash {cmd!r}, pixi global first on the hook's PATH", decision(cmd, **G) == "pass")
-    got = gwdecision(command=cmd, **G)
-    check(f"deny  gateway job {cmd!r}, pixi global first on the hook's PATH", got == "deny", got)
-    got = sdecision(cmd + "\n", **G)
-    check(f"deny  gateway terminal {cmd!r}, pixi global first on the hook's PATH", got == "deny", got)
+    for label, fn in (("gateway job", lambda c, **kw: gwdecision(command=c, **kw)), ("gateway terminal", lambda c, **kw: sdecision(c + "\n", **kw)),
+                      ("checkpoint job", lambda c, **kw: jdecision(command=c, **kw))):
+        got = fn(cmd, **G)
+        check(f"pass  {label} {cmd!r}, pixi global first on the hook's PATH", got == "pass", got)
+        if cmd in ("pytest -q", "mkdocs build"):  # (other's tools)
+            got = fn(cmd, **NOTPX)
+            check(f"deny  {label} {cmd!r}, a non-pixi copy first on the hook's PATH", got == "deny", got)
 for label, kw, want in (
-    ("argv, a bare name", dict(argv=["pytest", "-q"]), "deny"),
+    ("argv, a bare name", dict(argv=["pytest", "-q"]), "pass"),
     ("argv, pixi global's by its path", dict(argv=[f"{gbin}/pytest", "-q"]), "pass"),
     ("~/.pixi/bin by its path", dict(command="~/.pixi/bin/python3 -V"), "pass"),
     ("$HOME/.pixi/bin by its path", dict(command="$HOME/.pixi/bin/mkdocs build"), "pass"),
@@ -1806,18 +2302,43 @@ for label, kw, want in (
     ("pixi exec", dict(command="pixi exec black ."), "pass"),
     ("on another host (not checked)", dict(command="pytest -q", host="gpu1"), "pass"),
     ("a workspace env's by its path", dict(command=".pixi/envs/default/bin/pytest -q", cwd=pxproj), "pass"),
+    # PATH set in the job: where the name resolves is not known, as in Bash
+    ("PATH set in it", dict(command="PATH=/opt/x:$PATH pytest -q"), "deny"),
+    ("sudo", dict(argv=["sudo", "black", "."]), "deny"),
 ):
     got = gwdecision(**kw, **G)
     check(f"{want:5} gateway job, pixi global first on the hook's PATH: {label}", got == want, got)
-check("deny  gateway job, inside pixi shell (its env first on the hook's PATH)", gwdecision(command="pytest -q", **PS) == "deny")
-check("pass  gateway terminal, ~/.pixi/bin by its path", sdecision("~/.pixi/bin/mkdocs build\n", **G) == "pass")
-r = gwreason(command="pytest -q", cwd=pxproj, **G)
-check("gateway job: the reason says the gateway runs it with a PATH of its own, offers pixi run and the path",
-      "The gateway runs the job with a PATH of its own" in r and "/usr/bin" in r and "~/.pixi/bin/pytest" in r
-      and "make the job's command `pixi run pytest ...`" in r and "it sets PATH" not in r, r)
-r = why(gwsend("pytest -q\n", cwd=pxproj, **G)[0])
-check("gateway terminal: the reason says the gateway's terminal runs it with a PATH of its own",
-      "The gateway's terminal runs it with a PATH of its own" in r and "run it as `pixi run pytest ...`" in r, r)
+# A tool only in pixi global, not on the hook's PATH: Bash may find it there (its shell snapshot's PATH), but a job or
+# terminal gets no snapshot, and the gateway's imported folders (~/.local/bin, where pipx puts tools, say) may hold
+# another copy, so it is refused there.
+for cmd in ("mkdocs build", "black ."):
+    check(f"pass  Bash {cmd!r}, pixi global not on the hook's PATH", decision(cmd, HOME=str(gh)) == "pass")
+    for label, fn in (("gateway job", lambda c, **kw: gwdecision(command=c, **kw)), ("gateway terminal", lambda c, **kw: sdecision(c + "\n", **kw)),
+                      ("checkpoint job", lambda c, **kw: jdecision(command=c, **kw))):
+        got = fn(cmd, HOME=str(gh))
+        check(f"deny  {label} {cmd!r}, pixi global not on the hook's PATH", got == "deny", got)
+        got = fn(cmd, **PH)
+        check(f"deny  {label} {cmd!r}, $PIXI_HOME/bin not on the hook's PATH", got == "deny", got)
+        got = fn(f"{gbin}/{cmd}", HOME=str(gh))
+        check(f"pass  {label} {cmd!r}, pixi global's by its path", got == "pass", got)
+r = gwreason(command="mkdocs build", HOME=str(gh))
+check("gateway job, pixi global not on the hook's PATH: the reason offers its path",
+      f"A job or terminal gets Claude Code's PATH, which doesn't have {gbin}: run pixi global's `mkdocs` there by its path (`{gbin}/mkdocs`)" in r, r)
+r = why(gwsend("black .\n", **PH)[0])
+check("gateway terminal, $PIXI_HOME/bin not on the hook's PATH: the reason offers its path", f"(`{phome}/bin/black`)" in r, r)
+r = gwreason(command="mkdocs build", **NOTPX)
+check("gateway job, a non-pixi copy on the hook's PATH: no such note", "Claude Code's PATH" not in r, r)
+check("pass  gateway job, inside pixi shell (its env first on the hook's PATH)", gwdecision(command="pytest -q", **PS) == "pass")
+check("deny  gateway job, inside pixi shell: a tool the env lacks", gwdecision(command="flask run", **PS) == "deny")
+check("deny  gateway terminal, PATH set in it", sdecision("export PATH=/opt/x:$PATH; mkdocs build\n", **G) == "deny")
+r = gwreason(command="pytest -q", cwd=pxproj, **NOTPX)
+check("gateway job, a non-pixi copy first: no PATH note, offers pixi run",
+      "`pytest` would run Python outside pixi" in r and "PATH" not in r and "make the job's command `pixi run pytest ...`" in r, r)
+r = why(gwsend("pytest -q\n", cwd=pxproj, **NOTPX)[0])
+check("gateway terminal, a non-pixi copy first: no PATH note", "PATH" not in r and "run it as `pixi run pytest ...`" in r, r)
+r = gwreason(command="PATH=/opt/x:$PATH pytest -q", cwd=pxproj, **G)
+check("gateway job that sets PATH: the reason says so and offers the path, as in Bash",
+      "This command runs it with a PATH of its own" in r and "~/.pixi/bin/pytest" in r and "gateway runs" not in r, r)
 check("Bash: no gateway PATH note", "gateway" not in reason("PATH=/x:$PATH mkdocs build", **G))
 # (what runs under pixi run sets no PATH for the rest of the command)
 expect("pass", ["pixi run env PATH=/x ls; mkdocs build", "pixi run 'PATH=/x ls' && black ."], "pixi global: ", **G)
@@ -2121,6 +2642,9 @@ req_proj.mkdir()
 (req_proj / "requirements.txt").write_text("requests\n")
 check("requirements.txt marks a python project", "not on pixi" in reason("python x", cwd=req_proj))
 check("plain folder: one-off advice", "pixi exec" in reason("python x"))
+r = reason("python x")
+check("plain folder: a script runs with pixi run --script (pixi exec has no --script)",
+      "`pixi init --script file.py`" in r and "`pixi run --script file.py`" in r, r)
 
 print("project detection")
 # A git checkout wrapped out of folder, with docs/requirements.txt: the same wrapper from anywhere in it.
@@ -2137,7 +2661,7 @@ m.parent.mkdir(parents=True)
 m.write_text("[workspace]\n")
 check("wrapped repo is seen from docs/", f"{repo} is wrapped by" in reason("python x", cwd=repo / "docs"))
 check("wrapped repo is seen from its root", f"{repo} is wrapped by" in reason("python x", cwd=repo))
-# A wrapper made by 0.1.0, keyed by the nearest marker folder, is still found.
+# A wrapper at a nearer marker folder (made before a marker further up appeared) is still found.
 old = TMP / "oldrepo"
 (old / "sub").mkdir(parents=True)
 (old / ".git").mkdir()
@@ -2194,33 +2718,30 @@ data = TMP / "plugin-data"
 reason("python x", pixi=False, sid="d1", PIXI_GUARD_HOME=None, CLAUDE_PLUGIN_DATA=str(data))
 check("told markers go under CLAUDE_PLUGIN_DATA", (data / "told" / "d1").exists())
 check("... and nothing under the XDG state dir", not (TMP / ".local" / "state" / "pixi-guard").exists())
-reason("python x", pixi=False, sid="x1", PIXI_GUARD_HOME=None)
-check("without CLAUDE_PLUGIN_DATA, markers use the XDG state dir",
-      (TMP / ".local" / "state" / "pixi-guard" / "told" / "x1").exists())
+# Claude Code gives every plugin hook CLAUDE_PLUGIN_DATA; without it (guard.sh run by hand) no markers are kept.
+r1 = reason("python x", pixi=False, sid="x1", PIXI_GUARD_HOME=None)
+r2 = reason("python x", pixi=False, sid="x1", PIXI_GUARD_HOME=None)
+check("without CLAUDE_PLUGIN_DATA no markers: every refusal tells the user", "tell the user" in r1 and "tell the user" in r2, r2)
+check("... and nothing goes under the XDG state dir", not (TMP / ".local" / "state" / "pixi-guard").exists())
 stale = data / "told" / "stale"
 stale.write_text("")
 os.utime(stale, (time.time() - 30 * 86400,) * 2)
 reason("python x", pixi=False, sid="d2", PIXI_GUARD_HOME=None, CLAUDE_PLUGIN_DATA=str(data))
 check("old told markers are pruned", not stale.exists() and (data / "told" / "d2").exists())
-# Markers 0.1.0 left in the XDG state dir are pruned too (and the dir once empty), at a refusal or a session start.
-for when in ("refusal", "session start"):
-    h = TMP / ("oldstate-" + when.replace(" ", "-"))
-    old_told = h / ".local" / "state" / "pixi-guard" / "told"
-    old_told.mkdir(parents=True)
-    (old_told / "ancient").write_text("")
-    os.utime(old_told / "ancient", (time.time() - 30 * 86400,) * 2)
-    kw = dict(pixi=False, HOME=str(h), PIXI_GUARD_HOME=None, CLAUDE_PLUGIN_DATA=str(h / "data"))
-    if when == "refusal":
-        reason("python x", sid="o1", **kw)
-    else:
-        session(**kw)
-    check(f"0.1.0 told markers are pruned at a {when}, and their empty dir removed",
-          not (h / ".local" / "state" / "pixi-guard").exists(), list(h.rglob("*")))
-recent = TMP / "oldstate-recent" / ".local" / "state" / "pixi-guard" / "told"
-recent.mkdir(parents=True)
-(recent / "fresh").write_text("")
-session(pixi=False, HOME=str(TMP / "oldstate-recent"), PIXI_GUARD_HOME=None, CLAUDE_PLUGIN_DATA=str(TMP / "d3"))
-check("recent 0.1.0 told markers are kept", (recent / "fresh").exists())
+stale.write_text("")
+os.utime(stale, (time.time() - 30 * 86400,) * 2)
+session(pixi=False, PIXI_GUARD_HOME=None, CLAUDE_PLUGIN_DATA=str(data))
+check("old told markers are pruned at a session start too", not stale.exists() and (data / "told" / "d2").exists())
+# The XDG state dir 0.1.0 kept its markers in is no longer looked at.
+h = TMP / "oldstate"
+old_told = h / ".local" / "state" / "pixi-guard" / "told"
+old_told.mkdir(parents=True)
+(old_told / "ancient").write_text("")
+os.utime(old_told / "ancient", (time.time() - 30 * 86400,) * 2)
+kw = dict(pixi=False, HOME=str(h), PIXI_GUARD_HOME=None, CLAUDE_PLUGIN_DATA=str(h / "data"))
+reason("python x", sid="o1", **kw)
+session(**kw)
+check("0.1.0's XDG state dir is left alone", (old_told / "ancient").exists(), list(h.rglob("*")))
 
 print("finding pixi")
 for label, setup, extra in (
@@ -2267,7 +2788,7 @@ snippet = re.search(r"In a git checkout.*?```bash\n(.*?)```", skill, re.S).group
 if shutil.which("git"):
     fake = TMP / "skillbin"
     fake.mkdir()
-    # Like pixi 0.81 init: writes pixi.toml and appends to .gitignore / .gitattributes.
+    # Like pixi init: writes pixi.toml and appends to .gitignore / .gitattributes.
     (fake / "pixi").write_text('#!/bin/sh\n[ "$1" = init ] || exit 1\nfor a; do d=$a; done\nmkdir -p "$d"\n'
                                'printf \'[workspace]\\nname = "%s"\\n\' "$(basename "$d")" > "$d/pixi.toml"\n'
                                'echo ".pixi/" >> "$d/.gitignore"\necho "pixi.lock -diff" >> "$d/.gitattributes"\n')
@@ -2321,6 +2842,15 @@ readme = (REPO / "README.md").read_text()
 check("README installs it by its id", f"/plugin install {pj['name']}@{mk['name']}" in readme, pj["name"])
 check("README names the skill by its id", f"{pj['name']}:project" in readme and "`pixi:project`" not in readme)
 check("no top-level bin/ in the plugin", not (ROOT / "bin").exists())
+# Latest only: the dev manifest needs the pixi that made pixi.lock (the newest then; moved with every relock, see
+# docs/dev/TESTING.md), with no upper bound, and every dependency is "*".
+PIXI_MIN = "0.83.0"
+toml_text = (ROOT / "pixi.toml").read_text()
+manifest = tomllib.loads(toml_text)
+check(f"pixi.toml requires-pixi is >={PIXI_MIN}, no upper bound", manifest["workspace"].get("requires-pixi") == f">={PIXI_MIN}"
+      and len(re.findall(r"(?m)^requires-pixi\s*=", toml_text)) == 1, manifest["workspace"].get("requires-pixi"))
+check("pixi.toml: every dependency is \"*\"", manifest["dependencies"] and set(manifest["dependencies"].values()) == {"*"},
+      manifest["dependencies"])
 
 print("robustness")
 out, _ = run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": "Bash",
@@ -2350,7 +2880,7 @@ for nb, want in ((100, "pass"), (101, "deny"), (4, "pass"), (3, "deny")):
     check(f"{want:5} a value with {nb} escaped backslashes{' and an escaped quote' if nb % 2 == 0 else ''} before the command",
           got == want, got)
 out, _ = run("pre", None, raw='{"session_id":"s1","tool_input":{"command":"python x"},"tool_name":"mcp__plugin_gate_gw__job_start"}')
-check("the tool name after tool_input is still read (top level): a job's refusal", "the job's command" in why(out), out)
+check("the tool name after tool_input is still read (top level): a job's refusal", "job's command" in why(out), out)
 for label, ti in (("an argv in a nested object", {"meta": {"argv": ["ls"]}, "argv": ["python", "x.py"]}),
                   ("a command in a nested object", {"meta": {"command": "ls"}, "argv": ["python", "x.py"]})):
     got = verdict(*run("pre", {"session_id": "s1", "cwd": str(PLAIN), "tool_name": JOB, "tool_input": ti}))

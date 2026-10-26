@@ -1,13 +1,74 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.4.0 (2026-10-26)
+
+Only the latest Claude Code and pixi are supported.
+
+Added:
+
+- bash 5.3's `${ CMD; }` and `${| CMD; }` are read as commands when bash 5.3
+  or later runs them: Claude Code's shell, and the gateway's bash, which
+  runs its jobs and terminals and checkpoint's jobs. Under zsh, dash and
+  older bash they are read as before, also where one of those may run the
+  command too (a checkpoint job's `/bin/sh`, a shell prefix's shell).
+- With a shell prefix (`CLAUDE_CODE_SHELL_PREFIX`), a command is also read
+  as the shells the gateway's managed shell runs it in: until it is ready,
+  the shell that made Claude Code's shell snapshot, found the way Claude
+  Code finds its own (`CLAUDE_CODE_SHELL`, then `SHELL` when it is in
+  Claude Code's environment, then a bash or zsh on `PATH` or in the usual
+  folders; never `/bin/sh`); once its build finishes, its own bash,
+  whatever `CLAUDE_CODE_SHELL` is.
+- The dev manifest needs the newest pixi (`requires-pixi`), and the suite
+  checks it.
+
+Changed:
+
+- The gateway's jobs and terminals are read as bash 5.2 and as bash 5.3:
+  the gateway's bash is conda-forge's newest (5.2 today), no longer pinned.
+- checkpoint's `job_start` is read as the gateway's bash too: while the
+  gateway serves the session, it runs checkpoint's jobs.
+- A tool by its bare name in a gateway job or terminal is looked up on
+  Claude Code's `PATH` (gateway 0.11 gives them that `PATH`). It was
+  refused outright. Unlike in Bash, one that is only in pixi global's
+  folder, not on that `PATH`, is refused in a job or terminal (checkpoint's
+  too): no shell snapshot adds the folder there. The refusal gives its path.
+- README: the install steps (from a shell, `claude plugin marketplace add`
+  then `claude plugin install pixi-guard@pixi-guard`; in the desktop app)
+  and what adding a marketplace from GitHub needs (a git) are worded as in
+  the gateway's and checkpoint's READMEs.
+- A script without a workspace: the advice is `pixi init --script`, then
+  `pixi run --script` (it said `pixi exec`).
+- The tests run on the newest Python (3.15).
+
+Fixed:
+
+- In a `$(...)`, `case` or `#` right after an escaped character (`\(case`,
+  `\(#`) was read as a keyword or a comment, so the `)` after it didn't end
+  the `$(...)`, and a command after it could pass.
+
+Removed:
+
+- The markers' folder outside the plugin's data folder: Claude Code gives
+  every plugin hook one. `~/.local/state/pixi-guard/` (from 0.1.0) is no
+  longer cleaned up; delete it if it is there.
+- The README's minimum versions and rename note (the note is under 0.3.0).
+
+## 0.3.0 (2026-10-23)
 
 **Renamed.** The plugin is now `pixi-guard` (it was `pixi`): install id
 `pixi-guard@pixi-guard`, skill `pixi-guard:project`. An install of
-`pixi@pixi-guard` doesn't update to it. Uninstall it, update the
-marketplace, and install `pixi-guard@pixi-guard` (see
-[README, Install](README.md#install)). Wrappers and converted projects are
-kept.
+`pixi@pixi-guard` doesn't update to it. Remove it, then install the new one:
+
+```
+claude plugin uninstall pixi@pixi-guard
+claude plugin marketplace update pixi-guard
+claude plugin install pixi-guard@pixi-guard
+```
+
+If you added the marketplace with a tag (`p-w-rs/pixi-guard#v0.2.0`), the
+update keeps that tag: run `claude plugin marketplace remove pixi-guard` and
+`claude plugin marketplace add p-w-rs/pixi-guard` instead of the update.
+Wrappers and converted projects are kept.
 
 Added:
 

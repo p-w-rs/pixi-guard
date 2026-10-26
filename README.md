@@ -38,9 +38,10 @@ In Claude Code:
 /plugin install pixi-guard@pixi-guard
 ```
 
-From a shell: `claude plugin install pixi-guard --marketplace p-w-rs/pixi-guard`.
-In the desktop app: **+** next to the prompt box → **Plugins** → **Add
-marketplace**, enter `p-w-rs/pixi-guard`, then install `pixi-guard`.
+Or from a shell: `claude plugin marketplace add p-w-rs/pixi-guard`, then
+`claude plugin install pixi-guard@pixi-guard`. In the desktop app, add the
+marketplace from a terminal, then **+** → **Plugins** → **Add plugin** →
+**pixi-guard**.
 
 Then start a new session, or run `/reload-plugins` in a running one. To
 check that it works, ask Claude to run `pip --version`: it is refused, and
@@ -49,36 +50,22 @@ Claude is told the pixi way.
 To try it from a checkout without installing:
 `claude --plugin-dir plugins/pixi-guard`.
 
-**Installed as `pixi@pixi-guard`?** Up to 0.2.0 the plugin was named `pixi`,
-and that install doesn't update to the new name. Remove it, then install the
-new one:
-
-```
-claude plugin uninstall pixi@pixi-guard
-claude plugin marketplace update pixi-guard
-claude plugin install pixi-guard@pixi-guard
-```
-
-If you added the marketplace with a tag (`p-w-rs/pixi-guard#v0.2.0`), the
-update keeps that tag: run `claude plugin marketplace remove pixi-guard` and
-`claude plugin marketplace add p-w-rs/pixi-guard` instead of the update.
-Your wrappers and converted projects are kept.
-
 **Requirements.** macOS or Linux with `sh` and `awk`: the hook needs neither
-pixi nor Python. Claude Code 2.1.139 or newer, for exec-form hooks
-(`command` with `args`). pixi-guard is only hooks (no mods), so that is all
-it needs, in the terminal and in the desktop app. Tested on 2.1.301 (macOS)
-and 2.1.304 (Linux). pixi only for running Python in your projects; the
-advice is written for pixi 0.81 (`pixi init --script`, `pixi import`,
-`pixi workspace`).
+pixi nor Python. The latest Claude Code, in the terminal or the desktop app
+(pixi-guard is only hooks). The latest pixi, for running Python in your
+projects.
+
+Claude Code needs a git to add a marketplace from GitHub. Without one, pixi
+provides it: `pixi global install git` (with `~/.pixi/bin` on your PATH).
 
 **Settings.** None needed. Optional, set where Claude Code starts:
 `PIXI_GUARD_TOOLS` (the program names to refuse, as an awk regex such as
 `python|pip|uv`, replacing the built-in list) and `PIXI_GUARD_WRAP_DIR`
-(where out-of-folder wrappers go). The hook also reads `SHELL` and
-`CLAUDE_CODE_SHELL` (which shell runs Claude's commands), `VIRTUAL_ENV` and
-`CONDA_PREFIX` (an active env), `PATH`, `HOME` and `PIXI_HOME` (where a tool
-comes from), and `CLAUDE_PROJECT_DIR` (a gateway job's folder).
+(where out-of-folder wrappers go). The hook also reads `SHELL`,
+`CLAUDE_CODE_SHELL` and `CLAUDE_CODE_SHELL_PREFIX` (which shell runs
+Claude's commands), `VIRTUAL_ENV` and `CONDA_PREFIX` (an active env),
+`PATH`, `HOME` and `PIXI_HOME` (where a tool comes from), and
+`CLAUDE_PROJECT_DIR` (a gateway job's folder).
 
 ## What it checks
 
@@ -98,14 +85,15 @@ comes from), and `CLAUDE_PROJECT_DIR` (a gateway job's folder).
   the like. If Claude Code was started in an active
   venv or conda env, a Python script from its `bin` folder (`httpx`) is
   refused too.
-- **Every part of the command line.** It follows `&&`, pipes, `$(...)`,
-  `sh -c`, `eval`, heredocs and `echo`/`printf` text fed to a shell,
-  `xargs`, `find -exec`, `tmux`, wrappers (`sudo`, `env`, `timeout`,
-  `nice`, `direnv exec`, `mise exec`, the gateway's `gate with NAME --`,
-  `xcrun`, ...), commands that start other commands (`npx`, `npm exec`,
-  `pnpm exec`/`dlx`, `yarn exec`/`dlx`, `bunx`/`bun x`, `hyperfine`,
-  `watchexec`, `nodemon --exec`), the value of an alias
-  (`alias py=python3`), and default values (`${PYTHON:-python3} x.py`).
+- **Every part of the command line.** It follows `&&`, pipes, `$(...)`
+  (and bash 5.3's `${ ...; }`), `sh -c`, `eval`, heredocs and
+  `echo`/`printf` text fed to a shell, `xargs`, `find -exec`, `tmux`,
+  wrappers (`sudo`, `env`, `timeout`, `nice`, `direnv exec`, `mise exec`,
+  the gateway's `gate with NAME --`, `xcrun`, ...), commands that start
+  other commands (`npx`, `npm exec`, `pnpm exec`/`dlx`, `yarn exec`/`dlx`,
+  `bunx`/`bun x`, `hyperfine`, `watchexec`, `nodemon --exec`), the value of
+  an alias (`alias py=python3`), and default values
+  (`${PYTHON:-python3} x.py`).
 - **What passes.** A tool that comes from pixi: a name found in
   `~/.pixi/bin`, `$PIXI_HOME/bin` or a pixi environment's `bin` (also
   inside `pixi shell`), or a path there. Installers and env managers
@@ -130,11 +118,13 @@ With [checkpoint](https://github.com/p-w-rs/checkpoint) or
 text are checked before they run.
 
 - **checkpoint's `job_start`.** The `command` is read as `/bin/sh` reads it
-  (bash 3.2 on macOS). An `argv` list is read as the line checkpoint gives
-  `/bin/sh`: each element is one word. Relative paths are looked up in the
-  job's `cwd`.
-- **The gateway's `job_start`.** Read as the gateway's bash 5.2 reads it, in
-  the job's `cwd`, else the project folder (`$CLAUDE_PROJECT_DIR`). A job
+  (bash 3.2 on macOS), and as the gateway's bash reads it: while the
+  gateway serves the session, it runs checkpoint's jobs. An `argv` list is
+  read as the line checkpoint gives the shell: each element is one word.
+  Relative paths are looked up in the job's `cwd`.
+- **The gateway's `job_start`.** Read as bash 5.2 and as bash 5.3 read it
+  (the gateway's own bash is conda-forge's newest, 5.2 today), in the
+  job's `cwd`, else the project folder (`$CLAUDE_PROJECT_DIR`). A job
   on another host is not checked, like `ssh HOST python3`. `localhost` and
   the gateway's `m_` ids are checked: they can be this machine.
 - **The gateway's `terminal_send`.** The text is read as if typed into a
@@ -142,10 +132,11 @@ text are checked before they run.
   terminal is on, so text sent to a terminal on another host is checked as
   if it ran here. The terminal's folder is unknown, so run a pixi `#!`
   script there by its absolute path.
-- **A Python tool by its bare name** (`pytest`) is refused in gateway jobs
-  and terminals even when pixi has it: the gateway runs commands with a
-  `PATH` of its own. `pixi run pytest`, or the tool's path
-  (`~/.pixi/bin/pytest`), works.
+- **A Python tool by its bare name** (`pytest`) is looked up on Claude
+  Code's `PATH`: jobs and terminals get that `PATH` too. One from pixi
+  passes. Unlike in Bash, one found only in `~/.pixi/bin` (or
+  `$PIXI_HOME/bin`), not on that `PATH`, is refused: no shell snapshot adds
+  that folder there. Run it by its path (`~/.pixi/bin/pytest`).
 
 A refusal tells Claude to make the job's command the pixi one:
 `pixi run python train.py`, or the `argv` `["pixi", "run", "python", "train.py"]`.
@@ -205,8 +196,6 @@ wrapper for you: ask it to unwrap the project):
 - **Converted projects:** `pixi.toml` (or `[tool.pixi]`) and `pixi.lock` are
   your project's files now. `.pixi/` is the environment: delete it to free
   the space, and `pixi install` makes it again.
-- `~/.local/state/pixi-guard/` (or under `$XDG_STATE_HOME`): the markers,
-  when Claude Code gives the plugin no data folder. Delete it.
 
 ## Limits
 
@@ -228,6 +217,13 @@ wrapper for you: ask it to unwrap the project):
   later, some commit messages in `git commit -m "$(cat <<'EOF' ...)"` end
   early and run the backticks in them. If what then runs is Python, the
   command is refused, and Claude is told to use `git commit -F FILE`.
+  Behind a shell prefix (the gateway's managed shell), a command is also
+  read as the gateway's bash, which runs it once the managed shell is
+  ready, and as the shell that made Claude Code's shell snapshot, which
+  runs it before that. That shell is found the way Claude Code finds its
+  own: `CLAUDE_CODE_SHELL`, then `SHELL` when it is in Claude Code's
+  environment, then a bash or zsh on `PATH` or in `/bin`, `/usr/bin`,
+  `/usr/local/bin` or `/opt/homebrew/bin`.
 
 The full list, with examples: [docs/dev/LIMITS.md](docs/dev/LIMITS.md).
 

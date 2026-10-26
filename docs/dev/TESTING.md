@@ -16,6 +16,28 @@ Every behaviour change gets a test: a command that must be refused, and a
 near miss that must pass. A test also checks that the version at the top of
 [CLAUDE.md](../../CLAUDE.md) matches `plugin.json`.
 
+Before a release, move to the newest pixi and Python, then run both suites:
+
+```bash
+pixi self-update
+pixi update            # relocks python = "*" to the newest
+```
+
+Then set `requires-pixi` in `pixi.toml` to that pixi's version, and
+`PIXI_MIN` in `tests/run_tests.py` with it (a test checks the manifest). An
+older pixi refuses the manifest; to keep one installed, run the suites
+through `pixi exec --spec pixi==VERSION pixi run test`.
+
+Where a real bash 3.2, 5.2 or 5.3 is found (`/bin/bash`, `bash` on `PATH`,
+the Homebrew and MacPorts folders, or paths in `PIXI_GUARD_TEST_BASH`,
+separated by `:`), the suite also checks that it runs the tool in the
+commands refused for it and nothing in the near misses; likewise dash and
+zsh (on `PATH`, or `/bin/zsh`) for those only they run. For bash 5.2:
+`PIXI_GUARD_TEST_BASH=$(pixi exec --spec bash=5.2 bash -c 'command -v bash') pixi run test`.
+
+The suite stops when the temp folder's path (`TMPDIR`) holds `bash` or
+`zsh`: the shell prefix tests take any path holding one for that shell.
+
 ## The matrix
 
 `test-matrix` runs the whole suite once per variant, through `PATH` shims:
@@ -28,6 +50,31 @@ matrix's variants.
 Some checks measure the hook's CPU time against a budget, and run once more
 before failing. On a heavily loaded machine a timing check can still fail;
 run it again before looking for a bug.
+
+## 0.4.0 verification
+
+Run on 2026-10-24 and 25 (Claude Code 2.1.310 on macOS and Linux; pixi
+0.83.0).
+
+- The suite on macOS arm64 (BWK awk; `/bin/sh` is bash 3.2): 3351 passed
+  (after one rerun: two 160 KB checks ran over their 4 s CPU budget on a
+  loaded machine; an A/B run against the 0.3.0-era guard showed no
+  slowdown); the matrix (gawk, gawk `--posix`, dash, dash with gawk
+  `--posix`): 5 of 5 variants green.
+- The suite on Linux (Debian 13 arm64 VM; dash, mawk 1.3.4 as `awk`): 3178
+  passed; the matrix with gawk added: 7 of 7 variants green (after one rerun
+  for CPU budgets). busybox awk was not run (no busybox on the VM, none on
+  conda-forge).
+- `claude plugin validate` for the plugin and the marketplace.
+- Live sessions (the real Claude Code TUI with a scripted model, installed
+  from local git marketplaces), in checkpoint's acceptance_independence:
+  pixi-guard alone, with checkpoint, with the gateway, and all three, on
+  macOS and Linux: every check passed (96 of 96 in that script on each).
+  Python refused in Bash, in both plugins' `job_start` and in the gateway's
+  `terminal_send`, while the other plugins keep working.
+- Not run: the suite through Rosetta, busybox awk, the skill's convert, wrap
+  and unwrap in a live session, an install from GitHub of the released
+  version.
 
 ## 0.3.0 verification
 

@@ -1,6 +1,6 @@
 # CLAUDE.md: working on pixi-guard
 
-The plugin is `plugins/pixi-guard/` (plugin name `pixi-guard`, v0.3.0). User docs:
+The plugin is `plugins/pixi-guard/` (plugin name `pixi-guard`, v0.4.0). User docs:
 [README.md](README.md); the full limits list is
 [docs/dev/LIMITS.md](docs/dev/LIMITS.md), the suite and what a release's
 verification covers [docs/dev/TESTING.md](docs/dev/TESTING.md), releases
@@ -42,15 +42,50 @@ verification covers [docs/dev/TESTING.md](docs/dev/TESTING.md), releases
   behind the 1MB cap). By `tool_name` it sets:
   - `job=check` (also for an `argv` from a tool not named here): `bashver /bin/sh` instead of Claude
     Code's shell (checkpoint runs jobs with `/bin/sh`; `PIXI_GUARD_JOB_SH`
-    replaces it in tests);
-  - `job=gw`: `b52=1` (the gateway's bash is pinned at 5.x, locked at
-    5.2.37; no shell is asked) and `gwp=1` (its own PATH, see `PATHSET`). A
+    replaces it in tests), then `b52=1 b53=2` as for `job=gw` (while the
+    gateway serves the session, checkpoint hands it the job); `sb52` keeps
+    `/bin/sh`'s own 5.2 reading for the note; `zd=1` (`/bin/sh` may be
+    dash, awk `ZD`);
+  - `job=gw`: `b52=1 b53=2` (the gateway's own bash, conda-forge's newest:
+    5.2 today, any version its `bash = "*"` gets later, so it is read as
+    5.2 and as 5.3 and later, awk `F52`; no shell is asked). A
     `host` other than none, `""`, `localhost` or a well-formed `m_` id (`m_`
     and 26 of a-z2-7, `hostid`, which adds a note to the reason) exits
     unchecked: the job runs on another machine;
-  - `term=1` (`terminal_send`): `b52=1 gwp=1 tcd=1` (`TCD`: the terminal's
+  - `term=1` (`terminal_send`): `b52=1 b53=2 tcd=1` (`TCD`: the terminal's
     folder is unknown, so a relative `*.py` is not looked up, as after
-    `cd`).
+    `cd`);
+  - anything else: `bashver` (Claude Code's shell). With
+    `CLAUDE_CODE_SHELL_PREFIX` set (the gateway's gate-sh), the gateway's
+    managed shell may not be ready: gate-sh then runs a script in the shell
+    that made its snapshot, never `/bin/sh`, found the way Claude Code finds
+    its shell (gate-sh's `gw_fallback_shell`): `CLAUDE_CODE_SHELL`, then
+    `SHELL` (only when it is in the environment: bash as sh, macOS's
+    `/bin/sh`, sets one itself, the login shell), then the preferred shell
+    (bash when `SHELL` holds "bash", else zsh) on `PATH`, in `/bin`,
+    `/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, the other there, the
+    other on `PATH`; the first that `shfits` (an absolute path without `=`
+    to an executable file that holds zsh, a zsh, else bash, a bash; `onpath`
+    takes absolute folders only). None: gate-sh refuses the command. The
+    hook can't see the snapshot: `fallback_sh` takes the first that fits
+    (Claude Code made the snapshot with it, in the same environment), or the
+    first bash when `CLAUDE_CODE_SHELL` names a bash that isn't there now
+    (the gateway's, during a rebuild, may have made it). `fbash` is that
+    shell when it is a bash (`firstsh`, `inplaces`; `PIXI_GUARD_SHELL_DIRS`
+    replaces those folders in tests); a zsh is read anyway (the zsh views,
+    `zd`). `fbash` is asked with `bashver "$fbash"` unless `bashver` asked
+    it above as Claude Code's shell (`cbsh`; that reading stays: another
+    prefix runs Claude Code's shell; `pfx` names `fbash` for the note when
+    it reads as bash 3.2).
+    Once its build finishes, gate-sh runs them in the gateway's bash
+    whatever `CLAUDE_CODE_SHELL` is (`gsh`: `b52=1 b53=2`, `sb52` the
+    user's shells' own 5.2 reading for the note); `zd=1` (zsh may run it).
+
+  Jobs and terminals get Claude Code's `PATH` (gateway 0.11; a checkpoint
+  job the gateway runs gets checkpoint's environment), so their tool names
+  are looked up on the hook's alone: no shell snapshot adds pixi global's
+  folder there, as it may for Bash (`toolpath`, `pxglobal`; the refusal
+  then gives the tool's path).
 
   For a job, `getcwd` takes tool_input's `cwd` (`jc`, relative to the
   session's); a gateway job with none runs in `$CLAUDE_PROJECT_DIR`, else
@@ -103,15 +138,37 @@ verification covers [docs/dev/TESTING.md](docs/dev/TESTING.md), releases
   It reads as bash 5 (view 0); where zsh, dash or bash 3.2 would read the
   text differently (quotes in `"${...}"`, a bare `{` in `${...}`, `${...}`
   inside `$(...)`, `$[...]`, `!(...)`), `parse()` queues the range again for
-  that view (`VIEW` 1-4, at most once each). When Claude Code's shell is
+  that view (`VIEW` 1-5, at most once each). When Claude Code's shell is
   bash 3.x (`bashver`, awk `B32`), view 3 also ends `$(...)` where bash 3.2
   does (`cpar32`: no heredocs or case patterns; `close_sub` asks for view 3
-  where that differs). When it is bash 5.2 or later (`B52`), view 4 reads a
+  where that differs). B32 can come with B53 and F52 (bash 3.2 and the
+  gateway's bash: a checkpoint job with `/bin/sh` bash 3.2, a command
+  behind a shell prefix), so view 0 also asks for view 3 where it reads a
+  `${ CMD; }` (`fstart`): bash 3.2 reads it as text, and a `)` in it can
+  end the `$(...)`. When it is bash 5.2 or later (`B52`), view 4 reads a
   heredoc in a `$(...)`, `<(...)` or `>(...)` body (ranges with `RC`) as
   bash 5.2 does: a line that starts with the delimiter and has a `)` after
   it ends the body, and the rest of that line is code (`body_end` cp 2 in
   `cpar`, 3 in `parse()`; view 0 asks for view 4 where `cpar` sees such a
-  line, cp 1). See invariant 10.
+  line, cp 1). When it is bash 5.3 or later (`B53`), views 0 and 4 read
+  `${ CMD; }` and `${| CMD; }` (`fstart`: `${` and a blank, a newline or
+  `|`) as command substitutions, like `$(...)`: `fbrace`/`fsub` queue CMD
+  (range `RC` 2), also from `brace_end`, `substscan` and inside `cpar`;
+  `cpar` with `fb` finds the `}` that ends it (one where a reserved word
+  may come, outside a case pattern: `rw`, `bd` the `{ }` groups, `fkw` the
+  keywords, `pat`), and a heredoc
+  in CMD ends at a line that starts with its delimiter and has a `}` after
+  it (`body_end` with `cc` `}`). For the gateway's bash (`F52`), view 0
+  also asks for view 5 where it reads a `${ CMD; }` (`fstart`, `ALT5`):
+  bash 5.2 reads `${` to its first `}` as a bad substitution, drops the
+  rest of that line and runs the next ones, so view 5 reads the text as
+  bash 5.2 does (`${...}` as text, heredocs in `$(...)` as view 4; tag
+  `f52` for the note). With `ZD` (zsh or dash may run it: a checkpoint
+  job; zsh, behind a shell prefix), view 0 also asks for views 1 and 2
+  where they end that `${...}` elsewhere than bash 5.2 does, as `brace()`
+  asks for a plain `${...}` (`zdalt`, called once CMD's end is found, so a
+  deep nest runs out of depth before each one looks ahead to the end). See
+  invariant 10.
   Tools: `istool` lets a path into a pixi env's `bin` through (`pixibin`:
   `~/.pixi/bin`, `$PIXI_HOME/bin`, `.pixi/envs/NAME/bin`), except installers
   and env managers (`instre`), and lists a tool by its bare name for the
@@ -121,9 +178,7 @@ verification covers [docs/dev/TESTING.md](docs/dev/TESTING.md), releases
   (an assignment, `export`/`declare` ..., zsh's `path=(...)`), or runs it
   through `sudo`/`doas`, `su`/`runuser`, `env -i` or `env -u PATH`, or
   `xcrun` with a program left to run (Xcode's folders come first; not
-  `xcrun --show-sdk-path` or `-f`), and from `BEGIN` for every gateway job
-  and terminal (`gwp`: the gateway's folders, `import_path`, then
-  `/usr/bin:/bin:/usr/sbin:/sbin`). A `*.py` run by its path that the
+  `xcrun --show-sdk-path` or `-f`). A `*.py` run by its path that the
   same command writes (`wtgt`: redirections, `tee`, `sed -i`, `cp`/`mv`,
   `curl -o`, ...) or after a change of folder (`CDX`) is refused in `END`.
   After the scan, the shell decides what it left (`py PATH`, `tool NAME TAG`
@@ -147,8 +202,11 @@ claude plugin validate .          # and `claude plugin validate ../..`
 claude --plugin-dir .             # try it without installing
 ```
 
-CI runs both suites on Linux and macOS; see
-[docs/dev/TESTING.md](docs/dev/TESTING.md).
+There is no CI. Before a release: `pixi self-update` and `pixi update` (the
+test Python is `"*"`, so only a relock moves it), `requires-pixi` in
+`pixi.toml` (and `PIXI_MIN` in the tests) set to that pixi, then both
+suites; see [docs/dev/TESTING.md](docs/dev/TESTING.md). An older pixi
+refuses the manifest: `pixi exec --spec pixi==VERSION pixi run test`.
 
 ## Invariants
 
@@ -172,7 +230,8 @@ CI runs both suites on Linux and macOS; see
    lets the command through (hence also the watchdog, invariant 3). So the queues
    (strings: 4x the input in bytes; ranges: 200k), the look-ahead scans
    (`spent()`: 8x the input), heredoc delimiters (256 characters) and
-   recursion (`cpar` and `brace_end` 200, `check` 10 deep) have budgets;
+   recursion (`cpar`, also for `${ CMD; }`, and `brace_end` 200, `check`
+   10 deep) have budgets;
    running out prints `complex`, which is refused like a hit ("too large
    or too deeply nested", `PIXI_GUARD=ask` still asks). A new look-ahead loop must
    call `spent()` or stay within one pass, and stop once `hit` is set
@@ -218,16 +277,17 @@ CI runs both suites on Linux and macOS; see
    physical path (`pwd -P`), so `/tmp` and `/private/tmp` agree. Its name
    (`<name>_-<cksum>`) must not change, or existing wrappers are lost.
 7. No state in the plugin folder (it is replaced on update). "told" markers
-   go to `$CLAUDE_PLUGIN_DATA/told` (else `~/.local/state/pixi-guard/told`;
-   `PIXI_GUARD_HOME` replaces the folder that holds `told`, and the tests
-   set it); `prune_told` drops week-old ones there and in the 0.1.0 XDG
-   folder;
-   wrappers stay in `~/.local/share/pixi-guard/wrap` (outlive the plugin,
+   go to `$CLAUDE_PLUGIN_DATA/told` (Claude Code sets it for every plugin
+   hook; `PIXI_GUARD_HOME` replaces the folder that holds `told`, and the
+   tests set it; with neither, no markers); `prune_told` drops week-old
+   ones; wrappers stay in `~/.local/share/pixi-guard/wrap` (outlive the plugin,
    reachable from Bash). Nothing needs settings.json; the `PIXI_GUARD_*`
    environment variables are optional overrides (`PIXI_GUARD_PIXI` is for
    tests: it names the pixi to use and turns the search off; so are
-   `PIXI_GUARD_WATCHDOG` and `PIXI_GUARD_JOB_SH`, the shell asked for a
-   job's reading instead of `/bin/sh`).
+   `PIXI_GUARD_WATCHDOG`, `PIXI_GUARD_JOB_SH`, the shell asked for a
+   job's reading instead of `/bin/sh`, and `PIXI_GUARD_SHELL_DIRS`, the
+   folders searched instead of Claude Code's usual ones for the shell a
+   shell prefix falls back to, `:` between them).
 8. No top-level `bin/` in the plugin.
 9. The plugin name is `pixi-guard` (install id `pixi-guard@pixi-guard`,
    skill `pixi-guard:project`, data folder `pixi-guard-pixi-guard`, which
@@ -235,7 +295,7 @@ CI runs both suites on Linux and macOS; see
    `A-Za-z0-9_-` into `-`; the hook takes it from `$CLAUDE_PLUGIN_DATA`),
    and it stays that: a rename orphans
    existing installs. It was `pixi` up to 0.2.0; those installs must be
-   uninstalled and `pixi-guard@pixi-guard` installed (README, Install). The
+   uninstalled and `pixi-guard@pixi-guard` installed (CHANGELOG, 0.3.0). The
    skill's name in guard.sh's texts must be `<plugin name>:project` (a test
    checks it).
 10. What depends on the machine is read only where it decides, and is
@@ -244,10 +304,23 @@ CI runs both suites on Linux and macOS; see
    only then, because zsh and bash 5 users write ``Don't ... (it's) ...
    `pip` `` in commit heredocs, which bash 3.2 alone runs. Likewise bash 5.2
    and later turn view 4 on (``EOFError ... :)`` in a commit heredoc is
-   harmless elsewhere). For a checkpoint job the shell asked is `/bin/sh`
-   (bash 3.2 on macOS; dash, no version, on Debian), which runs it. Gateway
-   jobs and terminals are read as a fixed bash 5.2 (the gateway's own), and
-   no shell is asked. A gateway job with no `cwd` runs in
+   harmless elsewhere), and bash 5.3 and later the `${ CMD; }` reading (to
+   zsh, dash and older bash it is a bad substitution, so it stays text
+   there). For a checkpoint job the shell asked is `/bin/sh` (bash 3.2 on
+   macOS; dash, no version, on Debian), which runs it; behind a shell
+   prefix, also the bash gate-sh may run it in while the managed shell
+   isn't ready (the one that made the snapshot, found as Claude Code finds
+   its shell: `CLAUDE_CODE_SHELL`, then `SHELL` when it is in the
+   environment, then on `PATH` and in Claude Code's usual folders; never
+   `/bin/sh`; `fallback_sh`) when it was not asked as Claude Code's.
+   Gateway jobs and terminals, checkpoint jobs (the gateway runs them while
+   it serves the session) and commands behind a shell prefix (the managed
+   shell once ready, whatever `CLAUDE_CODE_SHELL` is) are read as bash 5.2
+   and as 5.3 and later (the gateway's own bash is conda-forge's newest,
+   5.2.37 today, and its `bash = "*"` lets it move), and no shell is
+   asked; checkpoint jobs and commands behind a prefix also as zsh and dash
+   read a `${ ...}` (`ZD`). A gateway job with no
+   `cwd` runs in
    `$CLAUDE_PROJECT_DIR` (else the session's folder). The
    scan reads `HOME` and `PIXI_HOME` (`ENVIRON`)
    for literal paths into pixi's folders. After the scan (outside the
@@ -255,7 +328,8 @@ CI runs both suites on Linux and macOS; see
    its first KB starts with a `#!` that runs pixi (literal paths only; a
    relative one not after `cd`, `env -C`, `-execdir`, ...: `CDX`; none the
    command writes); at most 16 tool names, each looked up with `command -v`
-   (or, if not found, in `~/.pixi/bin` and `$PIXI_HOME/bin`) and let through
+   (or, if not found and not in a job or terminal, in `~/.pixi/bin` and
+   `$PIXI_HOME/bin`) and let through
    only from a pixi env's `bin`; and with a venv or conda env active (never
    a pixi one: not under `.pixi/envs`, no `conda-meta/pixi`) at most 256
    bare names looked up in its `bin`, refused if a Python script.

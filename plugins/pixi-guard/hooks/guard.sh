@@ -24,20 +24,16 @@
 mode=$1
 case $0 in */*) here=${0%/*} ;; *) here=. ;; esac
 [ "$mode" = wrap-path ] || input=$(cat)
-# Small state ("told" markers): the plugin's data dir when Claude Code gives one.
-st=${PIXI_GUARD_HOME:-${CLAUDE_PLUGIN_DATA:-${XDG_STATE_HOME:-$HOME/.local/state}/pixi-guard}}
+# Small state ("told" markers): the plugin's data folder, which Claude Code
+# gives every plugin hook. With none (guard.sh run by hand), no markers.
+st=${PIXI_GUARD_HOME:-${CLAUDE_PLUGIN_DATA:-}}
 # Wrappers must outlive the plugin and be reachable from Claude's Bash tool.
 wrapdir=${PIXI_GUARD_WRAP_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/pixi-guard/wrap}
-told=$st/told
+told=${st:+$st/told}
 
-# "told" markers only matter within a session: drop those older than a week,
-# also the ones 0.1.0 left in the XDG state dir (and that dir once empty).
+# "told" markers only matter within a session: drop those older than a week.
 prune_told() {
-	old=${XDG_STATE_HOME:-$HOME/.local/state}/pixi-guard/told
-	for d in "$told" "$old"; do
-		[ -d "$d" ] && find "$d" -type f -mtime +7 -exec rm -f {} + 2>/dev/null
-	done
-	[ "$old" = "$told" ] || rmdir "$old" "${old%/told}" 2>/dev/null
+	[ -n "$told" ] && [ -d "$told" ] && find "$told" -type f -mtime +7 -exec rm -f {} + 2>/dev/null
 	return 0
 }
 
@@ -362,7 +358,8 @@ wrap_manifest() {
 # patterns, sh -c, eval, trap, tmux and screen, wrappers and their options,
 # find -exec. Text in quotes or heredocs is not a command, so `git commit -m
 # "pip install"` passes. It reads the command as bash does, and again as
-# zsh, dash or bash 3.2 do where they would read it differently.
+# zsh, dash or bash 3.2 do where they would read it differently; when bash
+# 5.3 or later runs it, ${ CMD; } and ${| CMD; } are command substitutions.
 #
 # Linear time even in BWK awk (whose substr() and length() walk the whole
 # string): the text is split into ch[] once, and words grow through small
@@ -373,16 +370,12 @@ wrap_manifest() {
 # (which would let it through). It runs in the background: $! is its awk (see
 # watched_scan).
 scan() {
-	printf '%s' "$1" | awk -v tools="${PIXI_GUARD_TOOLS:-}" -v b32="${b32:-0}" -v b52="${b52:-0}" -v vb="${vb:-0}" -v tcd="${tcd:-0}" -v gwp="${gwp:-0}" '
+	printf '%s' "$1" | awk -v tools="${PIXI_GUARD_TOOLS:-}" -v b32="${b32:-0}" -v b52="${b52:-0}" -v b53="${b53:-0}" -v vb="${vb:-0}" -v tcd="${tcd:-0}" -v zd="${zd:-0}" '
 	BEGIN {
 		RS = "\001"
 		# TCD: the command runs in a folder not known here (a gateway
 		# terminal'"'"'s), so a relative *.py path is not looked up (as after cd).
 		CDX = (tcd == 1)
-		# GWP: the gateway runs it with a PATH of its own (its folders, then
-		# /usr/bin:/bin...), not the one bare names are looked up in here, as
-		# if it set PATH (see deftool).
-		PATHSET = (gwp == 1)
 		# (pip-NAME, or pip-VERSION: not pip-check-deps.sh)
 		if (tools == "") tools = "python|python[0-9][0-9.]*|pythonw|pypy|pypy[0-9][0-9.]*|pip|pip[0-9][0-9.]*|pipx|pip-[a-z0-9-]+|pip-[0-9][0-9.]*|uv|uvx|easy_install|easy_install-[0-9.]+|conda|mamba|micromamba|poetry|pipenv|pyenv|virtualenv|hatch|pdm|rye|flit|twine|tox|nox|ipython|ipython[0-9]|jupyter|jupyter-[a-z-]+|jupytext|pytest|py\\.test|coverage|coverage-?[0-9][0-9.]*|mypy|black|isort|flake8|pylint|uvicorn|gunicorn|flask|django-admin|streamlit|alembic|celery|torchrun|accelerate|deepspeed|sphinx-build|mkdocs"
 		toolre = "^(" tools ")$"
@@ -391,10 +384,16 @@ scan() {
 		instre = "^(pip.*|uv|uvx|easy_install.*|conda|mamba|micromamba|poetry|pipenv|pyenv|virtualenv|hatch|pdm|rye)$"
 		# B32: Claude Code runs commands with bash 3.x, which ends some $(...)
 		# elsewhere (see cpar32); B52: with bash 5.2 or later, which ends some
-		# heredocs in $(...) early (view 4, see body_end). VB: a virtual or
-		# conda env is active, so the bare program names are listed for the
-		# shell to look up in it (PG).
-		B32 = (b32 == 1); B52 = (b52 == 1); VB = (vb == 1)
+		# heredocs in $(...) early (view 4, see body_end); B53: with bash 5.3
+		# or later, which also runs ${ CMD; } and ${| CMD; } (see fstart); F52
+		# (b53=2, the gateway): with bash 5.2 or with 5.3 and later, so where
+		# view 0 reads a ${ CMD; }, view 5 reads the text again as bash 5.2
+		# does. ZD: zsh or dash may run it too (a checkpoint job'"'"'s /bin/sh,
+		# the shell a shell prefix runs it in while the gateway'"'"'s isn'"'"'t
+		# ready), to which a ${ CMD; } is a parameter expansion (see fstart).
+		# VB: a virtual or conda env is active, so the bare program names are
+		# listed for the shell to look up in it (PG).
+		B32 = (b32 == 1); B52 = (b52 == 1); B53 = (b53 == 1 || b53 == 2); F52 = (b53 == 2); VB = (vb == 1); ZD = (zd == 1)
 		# Where pixi keeps tools (see pixibin): ~/.pixi and $PIXI_HOME.
 		PXH = ENVIRON["HOME"]; sub(/\/+$/, "", PXH)
 		PXP = ENVIRON["PIXI_HOME"]; sub(/\/+$/, "", PXP)
@@ -530,13 +529,14 @@ scan() {
 		if (hit == "" && (NWT || WTA)) for (k = 1; k <= NPY; k++) if (wrote(PYP[k])) { x = PYP[k]; sub(/.*\//, "", x); found(x); PYW = 1; break }
 		# PATH set in the command (PATH=... pytest, export PATH=...): where a
 		# bare name resolves is not known here (see check1).
-		if (hit == "" && NTN && PATHSET) { found(TN[1]); PYP0 = 1; HV = TNS[TN[1]] == "b32" ? 3 : TNS[TN[1]] == "b52" ? 4 : 0 }
+		if (hit == "" && NTN && PATHSET) { found(TN[1]); PYP0 = 1; HV = TNS[TN[1]] == "b32" ? 3 : TNS[TN[1]] == "b52" ? 4 : TNS[TN[1]] == "f52" ? 5 : 0 }
 		# (a tool by its bare name seen before a budget ran out is still looked up)
 		if (hit == CX) { print "complex"; for (k = 1; k <= NTN; k++) print "tool " TN[k] " " TNS[TN[k]] }
 		else if (hit != "") {
 			print "hit " hit
 			if (B32 && HV == 3) print "b32"
 			if (HV == 4) print "b52"
+			if (HV == 5) print "f52"
 			if (PYCD) print "pycd"
 			if (PYW) print "written"
 			if (PYP0) print "pathset"
@@ -570,7 +570,8 @@ scan() {
 	# Queue ch[a..b] to be parsed (in the current view and pixi mode, RM).
 	# Returns 1 if it did.
 	# RC: it is (in) the body of a $(...), <(...) or >(...), where bash 5.2
-	# ends heredocs its own way (view 4, see body_end); the caller sets it.
+	# ends heredocs its own way (view 4, see body_end), or 2: of a ${ CMD; }
+	# (see fsub); the caller sets it.
 	function rpush(a, b) {
 		if (a > b) return 0
 		if (nr >= 200000) { toomuch(); return 0 }
@@ -685,11 +686,13 @@ scan() {
 
 	# Tokenize ch[lo..hi] into simple commands and check each one, the way
 	# shell VIEW reads them: 0 bash 5 (and the others where they agree),
-	# 1 zsh, 2 dash, 3 bash 3.2. Where one of them would read the text
-	# differently (see brace_end, $[), a view-0 pass queues it for that one.
+	# 1 zsh, 2 dash, 3 bash 3.2, 4 bash 5.2 and later (see body_end), 5 bash
+	# 5.2 where bash 5.3 would run a ${ CMD; } (F52, see fstart). Where one of
+	# them would read the text differently (see brace_end, $[), a view-0 pass
+	# queues it for that one.
 	function parse(lo, hi,    i, c, d, j, k, sq, dq, x) {
 		HI = hi; nw = 0; nhd = 0; ncmd = 0; curpipe = 1; wreset(); sq = dq = 0; cs = cw = pat = dbr = 0
-		gd = GL = pp = nb = NEA = ALT1 = ALT2 = ALT3 = ALT4 = PSPEND = HSN = DBE = ARS = 0
+		gd = GL = pp = nb = NEA = ALT1 = ALT2 = ALT3 = ALT4 = ALT5 = PSPEND = HSN = DBE = ARS = 0
 		for (i = lo; i <= hi && hit == ""; i++) {
 			c = ch[i]
 			# (wadd() inlined on the two hot paths)
@@ -845,6 +848,7 @@ scan() {
 			if (ALT2) { VIEW = 2; if (rpush(lo, hi)) { RF[nr] = FEED; RC[nr] = CSUB } }
 			if (ALT3) { VIEW = 3; if (rpush(lo, hi)) { RF[nr] = FEED; RC[nr] = CSUB } }
 			if (ALT4) { VIEW = 4; if (rpush(lo, hi)) { RF[nr] = FEED; RC[nr] = CSUB } }
+			if (ALT5) { VIEW = 5; if (rpush(lo, hi)) { RF[nr] = FEED; RC[nr] = CSUB } }
 			VIEW = 0
 		}
 	}
@@ -914,13 +918,68 @@ scan() {
 	}
 	# ${ ... } at i (the "$"): kept as text, but command substitutions inside
 	# run. If another shell would end it elsewhere, the text is read again
-	# that shell'"'"'s way (ALT1..3, see parse).
+	# that shell'"'"'s way (ALT1..3, see parse). A ${ CMD; } (see fstart) is one.
 	function brace(i, indq,    e, j) {
+		if (fstart(i, VIEW)) { j = fbrace(i); zdalt(i, indq); return j }
 		e = brace_end(i, indq, VIEW, 1)
 		j = e > HI ? HI : e
 		if (!VIEW && BALT && brace_end(i, indq, 1, 0) != e) { ALT1 = 1; if (indq) ALT2 = 1 }
 		WDX = 1; lit(i, j)
 		return j
+	}
+	# Does a ${ CMD; } command substitution start at the "$" at k: "${" and a
+	# blank, a newline or "|" (${| CMD; }, whose value is $REPLY)? bash 5.3
+	# and later (B53) run CMD, in its views (v 0 and 4); to zsh, dash and older
+	# bash it is a bad substitution. bash 5.2 reads it to the first "}" as a
+	# parameter expansion, reports it, drops the rest of the line and goes on
+	# with the next one, so lines bash 5.3 reads as CMD (a quoted heredoc
+	# too) can run as commands there.
+	# With F52 (the gateway'"'"'s bash: 5.2, or 5.3 and later), view 0 asks for
+	# view 5, which reads the text as bash 5.2 does; with B32 too (bash 3.2
+	# may run it as well: a checkpoint job'"'"'s /bin/sh, a shell prefix'"'"'s
+	# fallback), for view 3, which reads it as bash 3.2 does (${...} as text,
+	# $(...) ended by cpar32); with ZD (zsh or dash may run it), for views 1
+	# and 2 where they end it elsewhere (zdalt).
+	# fbody: where CMD starts.
+	function fstart(k, v,    c) {
+		if (!B53 || (v != 0 && v != 4) || nx(k + 1) != "{") return 0
+		c = nx(k + 2)
+		if (c != " " && c != "\t" && c != "\n" && c != "|") return 0
+		if (!VIEW) { if (F52) ALT5 = 1; if (B32) ALT3 = 1 }
+		return 1
+	}
+	# With ZD (zsh or dash may run it: a checkpoint job'"'"'s /bin/sh, the
+	# shell a shell prefix runs it in while the gateway'"'"'s isn'"'"'t ready),
+	# view 0 asks for views 1 and 2 where they end the ${ ...} at k elsewhere
+	# than bash 5.2 does, as brace() asks for a plain ${...} (dq: it is in
+	# "..."; their reading of ${...} differs only there). Called once the end
+	# of CMD is found: a deep nest of them then runs out of depth before
+	# each one looks ahead to the end of the text.
+	function zdalt(k, dq,    e) {
+		if (!ZD || VIEW || (ALT1 && ALT2) || hit != "") return
+		# (v 5: ${...} as text, as bash 5.2 reads it; v 1: as zsh does)
+		e = brace_end(k, dq, 5, 0); if (BALT && brace_end(k, dq, 1, 0) != e) { ALT1 = 1; if (dq) ALT2 = 1 }
+	}
+	function fbody(k) { return nx(k + 2) == "|" ? k + 3 : k + 2 }
+	# Index of the "}" ending the ${ CMD; } at k (HI + 1 if none; see cpar).
+	function fsub_end(k,    b, j) {
+		if (hit != "") return HI + 1
+		if (++CPD > 200) { toomuch(); CPD--; return HI + 1 }
+		b = fbody(k); j = cpar(b, 1); CPD--; spent(j - b)
+		return j
+	}
+	# Queue CMD (RC 2: a heredoc in it ends where bash 5.3 ends it, see
+	# body_end). Returns the index of the "}". SR: the range queued.
+	function fsub(k,    j) {
+		SR = 0; j = fsub_end(k)
+		if (rpush(fbody(k), j - 1)) { SR = nr; RC[nr] = 2 }
+		return j
+	}
+	# ${ CMD; } at i in a word: as $( CMD ) (dollar_paren), but what ${| CMD; }
+	# prints is not its value.
+	function fbrace(i,    j, w0) {
+		w0 = !wn; j = fsub(i); if (w0 && SR && nx(i + 2) != "|") PSPEND = SR
+		wadd("$()"); return j
 	}
 	# Where ${ ... } at i ends (HI + 1 if it does not), as shell view v reads
 	# it (see parse); q: queue the command substitutions in it. Quotes inside
@@ -933,7 +992,7 @@ scan() {
 	# that bash 3.2 would act on in $(...), where it does not skip ${...}.
 	# Like every look-ahead, it stops once a budget is spent (hit set: nested
 	# ${...$(${...})} read in two views would take exponential time).
-	function brace_end(i, indq, v, q,    j, depth, c, d, sq, dq, lsq, zb, balt, bop) {
+	function brace_end(i, indq, v, q,    j, depth, c, d, sq, dq, lsq, zb, balt, bop, z) {
 		lsq = indq && (v == 1 || v == 2); zb = !indq && v == 1
 		depth = 0; sq = dq = balt = bop = 0
 		for (j = i + 1; j <= HI && hit == ""; j++) {
@@ -950,6 +1009,8 @@ scan() {
 						j = close_paren(j + 2); CPD--
 					}
 				}
+				# (${x:-${ CMD; }}: bash 5.3 runs CMD)
+				else if (d == "{" && fstart(j, v)) { z = j; j = q ? fsub(j) : fsub_end(j); zdalt(z, indq || dq) }
 				else if (d == "{") { if (!sq && !dq) depth++; j++ }
 				else if (!sq && !dq && !lsq && d == "\047") { j = ansi_end(j + 1); if (indq) balt = 1 }
 				continue
@@ -1108,13 +1169,65 @@ scan() {
 	# statements, cw waits for "in", pat is set in a pattern (pst: at its start,
 	# where a "(" may lead it; pd: extglob parens in it). Heredocs waiting for
 	# their bodies are PDL[pb+1..NPD] (a stack shared with nested calls). D32
-	# is set where bash 3.2 reads the text otherwise (see close_sub).
-	function cpar(k,    depth, c, sq, dq, j, pb, cs, cw, pat, pst, pd) {
-		depth = 1; sq = dq = 0; pb = NPD; cs = cw = pat = pst = pd = 0
+	# is set where bash 3.2 reads the text otherwise (see close_sub). esc:
+	# the last character a backslash escaped (\(case is a word, and so is
+	# \(#x: no keyword, no comment).
+	# fb: the body of a ${ CMD; } (see fstart) instead, which ends at a "}"
+	# where a reserved word may come (rw): at the start of a command, after a
+	# keyword such as fi or done, or after a group'"'"'s "}" (not after a word:
+	# ${ echo }; } prints "}"), once the { ... } groups opened in it are closed
+	# (bd); a ")" ends nothing there. ws: where the word being read starts;
+	# fnw: after "function" (1) or "coproc" (2), whose NAME may be followed
+	# by a group.
+	function cpar(k, fb,    depth, c, sq, dq, j, pb, cs, cw, pat, pst, pd, bd, rw, ws, fnw, z, esc) {
+		depth = 1; sq = dq = 0; pb = NPD; cs = cw = pat = pst = pd = 0; bd = rw = 1; ws = fnw = 0; esc = -1
 		for (; k <= HI && hit == ""; k++) {
 			c = ch[k]
 			if (sq) { if (c == "\047") sq = 0; continue }
-			if (c == "\\") { k++; continue }
+			if (fb && !dq) {
+				if (c == " " || c == "\t") {
+					if (ws) {
+						if (fnw) {
+							# (coproc NAME { ...: not coproc CMD ARGS)
+							if (fnw == 2) { for (j = k; j < HI && (ch[j] == " " || ch[j] == "\t"); j++) ; spent(j - k) }
+							rw = fnw == 1 || (ch[j] == "{" && (nx(j + 1) == " " || nx(j + 1) == "\t" || nx(j + 1) == "\n")); fnw = 0
+						}
+						else { rw = fkw(ws, k - 1); fnw = FNW }
+						ws = 0
+					}
+					continue
+				}
+				if (c == "\n" || c == ";" || c == "&" || c == "|") { rw = 1; ws = fnw = 0 }
+				else if (c == "$" && nx(k + 1) == "(") {
+					# (jumped over: its ")" leaves the word going on)
+					if (!ws) ws = k
+					rw = 0
+					if (nx(k + 2) == "(" && (j = arith_end(k + 3))) k = j
+					else { if (++CPD > 200) { toomuch(); NPD = pb; return HI + 1 } k = cpar(k + 2); CPD-- }
+					continue
+				}
+				else if ((c == "<" || c == ">") && nx(k + 1) == "(") {
+					if (!ws) ws = k
+					rw = 0
+					if (++CPD > 200) { toomuch(); NPD = pb; return HI + 1 }
+					k = cpar(k + 2); CPD--; continue
+				}
+				else if (c == "(" && ws) {
+					# f() { ...: a function; else a glob group or an array, part of the word
+					if (nx(k + 1) == ")") { k++; rw = 1; ws = fnw = 0; continue }
+					rw = 0
+					if (++CPD > 200) { toomuch(); NPD = pb; return HI + 1 }
+					k = cpar(k + 1); CPD--; continue
+				}
+				else if (c == "(" || c == ")") { rw = 1; ws = fnw = 0 }
+				else if (c == "<" || c == ">") rw = ws = fnw = 0
+				else if (c == "\\" && nx(k + 1) == "\n") { k++; continue }
+				# (not in a case pattern: case x in (}) ... is one)
+				else if (c == "}" && rw && !pat) { if (--bd == 0) { NPD = pb; return k } continue }
+				else if (c == "{" && rw && !pat && (nx(k + 1) == " " || nx(k + 1) == "\t" || nx(k + 1) == "\n")) { bd++; continue }
+				else if (c != "#" || ws || !wstart(k)) { if (!ws) ws = k; rw = 0 }
+			}
+			if (c == "\\") { esc = ++k; continue }
 			if (dq) {
 				if (c == "\"") dq = 0
 				else if (c == "`") k = tick_end(k, HI)
@@ -1122,6 +1235,10 @@ scan() {
 					# (awk recursion is bounded: a deeper nest is "complex")
 					if (++CPD > 200) { toomuch(); NPD = pb; return HI + 1 }
 					k = cpar(k + 2); CPD--
+				}
+				else if (c == "$" && fstart(k, VIEW)) {
+					if (++CPD > 200) { toomuch(); NPD = pb; return HI + 1 }
+					z = k; k = cpar(fbody(k), 1); CPD--; zdalt(z, 1)
 				}
 				else if (c == "$" && nx(k + 1) == "{") {
 					# "${x:-")"}": skip it whole (a ")" or quote in it is not ours).
@@ -1137,13 +1254,17 @@ scan() {
 				continue
 			}
 			if (c == ";" && cs && (nx(k + 1) == ";" || nx(k + 1) == "&")) { k++; if (nx(k + 1) == "&") k++; pat = pst = 1; pd = 0; continue }
-			if (c == "c" && nx(k + 1) == "a" && wstart(k) && rng(k, k + 3) == "case" && bound(k + 4)) { D32 = 1; cs++; cw = 1; k += 3; continue }
-			if (c == "i" && cw && nx(k + 1) == "n" && wstart(k) && bound(k + 2)) { cw = 0; pat = pst = 1; pd = 0; k++; continue }
-			if (c == "e" && cs && nx(k + 1) == "s" && wstart(k) && rng(k, k + 3) == "esac" && bound(k + 4)) { cs--; pat = 0; k += 3; continue }
+			if (c == "c" && nx(k + 1) == "a" && wstart(k) && esc != k - 1 && rng(k, k + 3) == "case" && bound(k + 4)) { D32 = 1; cs++; cw = 1; k += 3; continue }
+			if (c == "i" && cw && nx(k + 1) == "n" && wstart(k) && esc != k - 1 && bound(k + 2)) { cw = 0; pat = pst = 1; pd = 0; k++; continue }
+			if (c == "e" && cs && nx(k + 1) == "s" && wstart(k) && esc != k - 1 && rng(k, k + 3) == "esac" && bound(k + 4)) { cs--; pat = 0; k += 3; continue }
 			if (c == "\047") sq = 1
 			else if (c == "\"") dq = 1
 			else if (c == "`") k = tick_end(k, HI)
 			else if (c == "$" && nx(k + 1) == "\047") k = ansi_end(k + 1)
+			else if (c == "$" && fstart(k, VIEW)) {
+				if (++CPD > 200) { toomuch(); NPD = pb; return HI + 1 }
+				z = k; k = cpar(fbody(k), 1); CPD--; zdalt(z, 0)
+			}
 			else if (c == "$" && nx(k + 1) == "{" && VIEW != 3) {
 				# ${x:-)}: bash 5, zsh and dash skip it whole, bash 3.2 does not.
 				D32 = 1; j = brace_end(k, 0, VIEW, 0)
@@ -1154,20 +1275,31 @@ scan() {
 				# (to dash, plain text: see parse)
 				if ((j = bracket_end(k + 1)) <= HI) { if (!VIEW && !BAR) ALT2 = 1; D32 = 1; k = j }
 			}
-			else if (c == "#" && wstart(k)) { D32 = 1; while (k < HI && ch[k + 1] != "\n") k++ }
+			else if (c == "#" && wstart(k) && esc != k - 1) { D32 = 1; while (k < HI && ch[k + 1] != "\n") k++ }
 			else if (c == "<" && nx(k + 1) == "<") {
 				if (nx(k + 2) == "<") k += 2
 				else { D32 = 1; k = read_delim(k + 2); NPD++; PDL[NPD] = DL; PDS[NPD] = DS }
 			}
 			else if (c == "\n" && NPD > pb) {
-				for (j = pb + 1; j <= NPD; j++) k = body_end(k, PDL[j], PDS[j], VIEW == 4 ? 2 : 1)
+				for (j = pb + 1; j <= NPD; j++) k = fb ? body_end(k, PDL[j], PDS[j], 2, "}") : body_end(k, PDL[j], PDS[j], VIEW >= 4 ? 2 : 1, ")")
 				NPD = pb
 			}
 			else if (c == "(") { if (nx(k + 1) == "(" && (j = arith_end(k + 2))) { D32 = 1; k = j } else depth++ }
-			else if (c == ")" && --depth == 0) { NPD = pb; return k }
+			else if (c == ")" && --depth == 0 && !fb) { NPD = pb; return k }
 		}
 		NPD = pb
 		return HI + 1
+	}
+	# Is ch[a..b] a word after which a reserved word may come (fi, done, ...;
+	# see cpar)? FNW: 1 after "function", 2 after "coproc" (a group may come
+	# after the next word too).
+	function fkw(a, b,    x) {
+		FNW = 0
+		if (b - a > 7) return 0
+		x = rng(a, b)
+		if (x == "function") { FNW = 1; return 0 }
+		if (x == "coproc") { FNW = 2; return 1 }
+		return x == "]]" || x ~ /^(fi|done|esac|then|do|else|elif|if|while|until|!|time)$/
 	}
 	# Does a word end before index k?
 	function bound(k,    c) {
@@ -1180,10 +1312,10 @@ scan() {
 		return p == " " || p == "\t" || p == "\n" || p == ";" || p == "&" || p == "|" || p == "(" || p == ")"
 	}
 	# Queue the command substitutions in ch[a..b] (heredoc bodies, arithmetic;
-	# q: quotes and comments count, as in name=(array words); SOP is then set
-	# if it holds an unquoted ; & | < > ( or ), and SOPP is the first one that
-	# is not part of a <(...) or >(...)).
-	function substscan(a, b, q,    k, c, sq, dq) {
+	# also ${ CMD; }, see fstart; q: quotes and comments count, as in
+	# name=(array words); SOP is then set if it holds an unquoted ; & | < > (
+	# or ), and SOPP is the first one that is not part of a <(...) or >(...)).
+	function substscan(a, b, q,    k, c, sq, dq, z) {
 		sq = dq = SOP = SOPP = 0
 		for (k = a; k <= b && hit == ""; k++) {
 			c = ch[k]
@@ -1193,6 +1325,7 @@ scan() {
 			if (c == "$") {
 				# $(( ... )) is read on, unless it is $( (subshell) ... ).
 				if (nx(k + 1) == "(") { if (nx(k + 2) == "(" && arith_end(k + 3)) k += 2; else k = subst(k) }
+				else if (fstart(k, VIEW)) { z = k; k = fsub(k); zdalt(z, !q || dq) }
 				else if (q && !dq && nx(k + 1) == "\047") k = ansi_end(k + 1)
 				continue
 			}
@@ -1263,10 +1396,13 @@ scan() {
 	# bash 5.2 and later (B52) end it there at any line that starts with the
 	# delimiter and has a ")" after it, and read the rest of that line as
 	# commands ("EOFError :)" in a commit message ends the $(...) early). That
-	# is view 4: cp 2 in cpar, 3 in parse() of a $(...) body (RC), where a line
-	# cut by the end of the range has the ")" that ends it. View 0 asks for it
-	# (cp 1) where it sees such a line.
-	function body_end(k, delim, strip, cp,    s, e, ls, dl, p) {
+	# is view 4 (and 5, bash 5.2 itself): cp 2 in cpar, 3 in parse() of a
+	# $(...) body (RC), where a line cut by the end of the range has the ")"
+	# that ends it. View 0 asks for view 4 (cp 1) where it sees such a line.
+	# cc: that ")", or "}" in a ${ CMD; }
+	# (RC 2), where bash 5.3 does the same with a "}" (cp 2 or 3, any view of
+	# it: only bash 5.3 runs CMD).
+	function body_end(k, delim, strip, cp, cc,    s, e, ls, dl, p) {
 		BS = s = k + 1; dl = length(delim)
 		while (s <= HI && hit == "") {
 			e = s
@@ -1275,9 +1411,9 @@ scan() {
 			if (strip) while (ls < e && ch[ls] == "\t") ls++
 			if (e - ls == dl && rng(ls, e - 1) == delim) { BE = s - 1; return e }
 			if (cp && e - ls > dl && rng(ls, ls + dl - 1) == delim) {
-				if (ch[ls + dl] == ")") { BE = s - 1; return ls + dl - 1 }
+				if (ch[ls + dl] == cc) { BE = s - 1; return ls + dl - 1 }
 				if (B52 && (cp > 1 || !VIEW)) {
-					for (p = ls + dl; p < e && ch[p] != ")"; p++) ;
+					for (p = ls + dl; p < e && ch[p] != cc; p++) ;
 					if (p < e || (cp == 3 && e > HI)) { if (cp == 1) ALT4 = 1; else { BE = s - 1; return ls + dl - 1 } }
 				}
 			}
@@ -1290,7 +1426,7 @@ scan() {
 	# flush() once their pipeline is complete (cat <<EOF |\n...\nEOF\nbash).
 	function bodies(i,    h, e) {
 		for (h = 1; h <= nhd && hit == ""; h++) {
-			e = body_end(i, HD[h], HS[h], (VIEW == 4 && CSUB) ? 3 : 0)
+			e = (CSUB == 2 && (VIEW == 0 || VIEW == 4)) ? body_end(i, HD[h], HS[h], 3, "}") : body_end(i, HD[h], HS[h], (VIEW >= 4 && CSUB) ? 3 : 0, ")")
 			defer(HC[h], BS, BE, HQ[h] ? "q" : "h")
 			i = e
 		}
@@ -1526,12 +1662,13 @@ scan() {
 		return 0
 	}
 	# Tool b by its bare name: list it for the shell (TN), which looks where
-	# it resolves. TNS: "b32" or "b52" if only that view (Claude Code'"'"'s bash,
-	# see close_sub and body_end) saw it, for the note; else "-". Returns 1 (a
-	# hit) when that can'"'"'t be told here: more than 16 names, or odd characters.
+	# it resolves. TNS: "b32", "b52" or "f52" if only that view (Claude Code'"'"'s
+	# bash, see close_sub and body_end; the gateway'"'"'s, see fstart) saw it, for
+	# the note; else "-". Returns 1 (a hit) when that can'"'"'t be told here: more
+	# than 16 names, or odd characters.
 	function deftool(b,    t) {
 		if (b !~ /^[A-Za-z0-9._+-]+$/) return 1
-		t = (B32 && VIEW == 3) ? "b32" : VIEW == 4 ? "b52" : "-"
+		t = (B32 && VIEW == 3) ? "b32" : VIEW == 4 ? "b52" : VIEW == 5 ? "f52" : "-"
 		if (b in TNS) { if (TNS[b] != t) TNS[b] = "-"; return 0 }
 		if (NTN >= 16) return 1
 		TNS[b] = t; TN[++NTN] = b
@@ -2369,26 +2506,112 @@ watched_scan() {
 	fi
 }
 
-# Is Claude Code's shell bash 3.x (b32=1) or bash 5.2 and later (b52=1)? It
-# runs commands with $SHELL (or CLAUDE_CODE_SHELL) when that is bash or zsh.
-# macOS's /bin/bash is 3.2, which ends some $(...) elsewhere than bash 5 and
-# zsh do (see cpar32); bash 5.2 and later end a heredoc in $(...) at a line
-# that starts with its delimiter and has a ")" after it (see body_end). With
-# $1, the same for that shell whatever its name: /bin/sh, which runs
-# checkpoint's jobs (bash 3.2 on macOS; dash, which has no --version, on
-# Debian).
+# Is Claude Code's shell bash 3.x (b32=1), bash 5.2 and later (b52=1), or
+# bash 5.3 and later (b52=1 b53=1)? It runs commands with $SHELL (or
+# CLAUDE_CODE_SHELL) when that is bash or zsh. macOS's /bin/bash is 3.2,
+# which ends some $(...) elsewhere than bash 5 and zsh do (see cpar32); bash
+# 5.2 and later end a heredoc in $(...) at a line that starts with its
+# delimiter and has a ")" after it (see body_end); bash 5.3 and later run
+# ${ CMD; } and ${| CMD; } (see fstart). With $1, the same for that shell
+# whatever its name: /bin/sh, which runs checkpoint's jobs (bash 3.2 on
+# macOS; dash, which has no --version, on Debian), or the bash the gateway's
+# gate-sh may run commands in while its managed shell isn't ready (see
+# fallback_sh). Sets bsh to the shell asked (else empty).
 bashver() {
 	if [ -n "${1:-}" ]; then
 		bsh=$1
 	else
 		bsh=${CLAUDE_CODE_SHELL:-${SHELL:-}}
-		case ${bsh##*/} in bash*) ;; *) return 0 ;; esac
+		case ${bsh##*/} in bash*) ;; *) bsh=; return 0 ;; esac
 	fi
 	case $("$bsh" --version </dev/null 2>/dev/null) in
 	*"version "[0-3].*) b32=1 ;;
-	*"version 5."[2-9]* | *"version 5."[1-9][0-9]* | *"version "[6-9].* | *"version "[1-9][0-9]*) b52=1 ;;
+	*"version 5.2"[!0-9]*) b52=1 ;;
+	*"version 5."[3-9]* | *"version 5."[1-9][0-9]* | *"version "[6-9].* | *"version "[1-9][0-9]*) b52=1 b53=1 ;;
 	esac
 	return 0
+}
+
+# The shell the gateway's gate-sh runs a script in while its managed shell
+# isn't ready (its gw_fallback_shell): the one that made the script's
+# snapshot, found the way Claude Code finds its shell. CLAUDE_CODE_SHELL,
+# then SHELL, then the preferred shell on PATH, in the usual places, the
+# other in those places, the other on PATH (bash is preferred when SHELL
+# holds "bash", else zsh); the first that fits (shfits). Never /bin/sh; with
+# none, gate-sh refuses the command. The hook can't see the snapshot: it
+# takes the first that fits, which is the shell Claude Code made the
+# snapshot with in this same environment. But a CLAUDE_CODE_SHELL that names
+# a bash that isn't there now (the gateway's, during a rebuild) may have
+# made it: then the first bash is taken. Sets fbash to the bash it may be
+# (else empty): a zsh is read anyway (see pre).
+fallback_sh() {
+	fbash=
+	fc=${CLAUDE_CODE_SHELL-}
+	if shfits "" "$fc"; then
+		case $fc in *zsh*) ;; *) fbash=$fc ;; esac
+		return 0
+	fi
+	fk=
+	case $fc in *zsh*) ;; *bash*) fk=bash ;; esac
+	# (SHELL only when it is in the environment: bash run as sh, macOS's
+	# /bin/sh, sets one itself, the login shell, which isn't Claude Code's)
+	fs=
+	case "
+$(env 2>/dev/null)" in *"
+SHELL="*) fs=${SHELL-} ;; esac
+	fc=$(firstsh "$fk" "$fs")
+	case $fc in *zsh*) ;; *) fbash=$fc ;; esac
+	return 0
+}
+
+# Does gate-sh take $2 as a shell (gw_fits)? An absolute path without "="
+# (env would read it as an assignment) to an executable file that holds zsh
+# (a zsh), else bash (a bash); with $1 "bash", a bash only.
+shfits() {
+	case $2 in
+	*=*) return 1 ;;
+	/*zsh*) [ "$1" != bash ] || return 1 ;;
+	/*bash*) ;;
+	*) return 1 ;;
+	esac
+	[ -f "$2" ] && [ -x "$2" ]
+}
+
+# The shell gate-sh takes after CLAUDE_CODE_SHELL, shfits $1: $2 (SHELL),
+# then the preferred shell on PATH, in the usual places
+# (PIXI_GUARD_SHELL_DIRS replaces them in tests, ":" between them), the
+# other there, the other on PATH. Run in $(...): its IFS and set -f stay
+# there.
+firstsh() {
+	if shfits "$1" "$2"; then printf '%s\n' "$2"; return 0; fi
+	case $2 in *bash*) set -- "$1" bash zsh ;; *) set -- "$1" zsh bash ;; esac
+	IFS=:
+	set -f
+	onpath "$1" "$2" || inplaces "$1" "$2" || inplaces "$1" "$3" || onpath "$1" "$3"
+	return 0
+}
+
+# The first executable file $2 on PATH (absolute folders without "="), when
+# it fits (shfits $1; gw_which).
+onpath() {
+	for d in ${PATH-}; do
+		case $d in *=*) continue ;; /*) ;; *) continue ;; esac
+		if [ -f "$d/$2" ] && [ -x "$d/$2" ]; then
+			shfits "$1" "$d/$2" || return 1
+			printf '%s\n' "$d/$2"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# The first $2 in Claude Code's usual places that fits (shfits $1;
+# gw_places).
+inplaces() {
+	for d in ${PIXI_GUARD_SHELL_DIRS-/bin:/usr/bin:/usr/local/bin:/opt/homebrew/bin}; do
+		if shfits "$1" "$d/$2"; then printf '%s\n' "$d/$2"; return 0; fi
+	done
+	return 1
 }
 
 # The active virtual and conda envs, one per line (not a pixi one: pixi shell
@@ -2451,10 +2674,13 @@ pixibin() {
 # from $cwd) that does not start with a #! line that runs pixi. toolpath:
 # "NAME TAG" for the first tool run by its bare name ("tool NAME TAG") that
 # does not resolve into a pixi environment's bin: where the hook's PATH finds
-# it, or if nowhere, ~/.pixi/bin or $PIXI_HOME/bin (Claude Code's Bash may
-# have them on its PATH when Claude Code itself does not). envbin: "NAME
-# DIR" for the first bare program name ("prog NAME") that is a Python script
-# in DIR/bin, DIR an active virtual or conda env.
+# it, or if nowhere, pixi global's (pxglobal: Claude Code's Bash may have its
+# folder on its PATH, from its shell snapshot, when Claude Code itself does
+# not). Not for a job or a terminal: they get no snapshot (the gateway's PATH
+# is its stand-ins, Claude Code's PATH, then the folders the user imported,
+# such as ~/.local/bin). envbin: "NAME DIR" for the first bare program name
+# ("prog NAME") that is a Python script in DIR/bin, DIR an active virtual or
+# conda env.
 pyscript() {
 	printf '%s\n' "$res" | sed -n 's/^py //p' | while IFS= read -r p; do
 		case $p in /*) f=$p ;; "~/"*) f=$HOME/${p#"~/"} ;; *) f=$cwd/$p ;; esac
@@ -2469,14 +2695,19 @@ toolpath() {
 		f=$(command -v "$p" 2>/dev/null) || f=
 		case $f in
 		/*) pixibin "${f%/*}" && continue ;;
-		"")
-			for d in "${PIXI_HOME:+${PIXI_HOME%/}/bin}" "${HOME:+${HOME%/}/.pixi/bin}"; do
-				[ -n "$d" ] && [ -f "$d/$p" ] && [ -x "$d/$p" ] && continue 2
-			done ;;
+		"") [ -z "$job$term" ] && pxglobal "$p" >/dev/null && continue ;;
 		esac
 		printf '%s %s\n' "$p" "$t"
 		break
 	done
+}
+# The folder of pixi global's tool $1, $PIXI_HOME/bin or ~/.pixi/bin, if it is
+# there.
+pxglobal() {
+	for d in "${PIXI_HOME:+${PIXI_HOME%/}/bin}" "${HOME:+${HOME%/}/.pixi/bin}"; do
+		[ -n "$d" ] && [ -f "$d/$1" ] && [ -x "$d/$1" ] && { printf '%s\n' "$d"; return 0; }
+	done
+	return 1
 }
 envbin() {
 	envdirs | while IFS= read -r d; do
@@ -2590,15 +2821,44 @@ pre)
 	fi
 	[ -n "$cmd" ] || exit 0
 	[ -n "$job" ] && jc=$(field cwd tool_input)
-	# (read by scan: see B32, B52, VB, TCD and GWP there)
-	b32=0 b52=0 vb=0 tcd=0 gwp=0 cwd=
+	# (read by scan: see B32, B52, B53, VB, TCD and ZD there)
+	b32=0 b52=0 b53=0 vb=0 tcd=0 zd=0 cwd= sb52=0 pfx= gsh=
 	case $job$term in
-	check) bashver "${PIXI_GUARD_JOB_SH:-/bin/sh}" ;;
-	# The gateway's own bash: bash 5 (its pixi.toml pins "5.*", locked at
-	# 5.2.37), with the gateway's own PATH (gwp).
-	gw) b52=1 gwp=1 ;;
-	1) b52=1 gwp=1 tcd=1 ;;
-	*) bashver ;;
+	# checkpoint runs a job with /bin/sh; while the gateway serves the session
+	# it hands the job to the gateway, which runs it in its own bash: read
+	# both ways (sb52: /bin/sh is bash 5.2 or later, for the note).
+	# (zd: /bin/sh may be dash, see ZD)
+	check) bashver "${PIXI_GUARD_JOB_SH:-/bin/sh}"; sb52=$b52; b52=1 b53=2 zd=1 ;;
+	# The gateway's own bash: conda-forge's newest (5.2 today; its pixi.toml
+	# takes any version), not asked: read as bash 5.2 and as 5.3 and later
+	# (b53=2, see F52).
+	gw) b52=1 b53=2 ;;
+	1) b52=1 b53=2 tcd=1 ;;
+	*)
+		bashver
+		cbsh=$bsh
+		# Through a shell prefix (CLAUDE_CODE_SHELL_PREFIX, the gateway's
+		# gate-sh), the gateway's managed shell may not be ready yet; then
+		# gate-sh runs the command in the shell that made its snapshot, never
+		# /bin/sh (fallback_sh). Its bash is asked too when it is not the one
+		# asked above (Claude Code's, which a prefix that is not gate-sh
+		# runs; pfx names it for the note when it reads as bash 3.2); a zsh
+		# is read anyway (the zsh views, and zd). Once ready (a build can
+		# finish during the session) gate-sh runs it in the gateway's own
+		# bash, whatever CLAUDE_CODE_SHELL is: read as for a gateway job
+		# (gsh; sb52: the user's shells' own 5.2 reading, for the note), and
+		# as zsh reads it (zd, see ZD).
+		if [ -n "${CLAUDE_CODE_SHELL_PREFIX:-}" ]; then
+			fallback_sh
+			# (Claude Code's shell, when bash, was asked above)
+			if [ -n "$fbash" ] && [ "$fbash" != "$cbsh" ]; then
+				c32=$b32; b32=0
+				bashver "$fbash"
+				[ "$b32" = 1 ] && pfx=$fbash
+				[ "$c32" = 1 ] && b32=1
+			fi
+			gsh=1 zd=1; sb52=$b52; b52=1 b53=2
+		fi ;;
 	esac
 	[ -n "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ] && [ -n "$(envdirs)" ] && vb=1
 	# (stderr off: bash reports a killed background job there)
@@ -2609,6 +2869,7 @@ pre)
 	has complex && complex=1
 	has b32 && tag=b32
 	has b52 && tag=b52
+	has f52 && tag=f52
 	note=
 	if [ -z "$hit" ]; then
 		[ -z "$complex" ] && case "
@@ -2617,6 +2878,9 @@ py "*) getcwd; hit=$(pyscript) ;; esac
 		# (a tool that runs outside pixi says more than "too large")
 		if [ -z "$hit" ] && t=$(toolpath) && [ -n "$t" ]; then
 			hit=${t%% *} tag=${t#* } complex=
+			# (pixi global's, but a job or terminal gets no shell snapshot: see toolpath)
+			[ -n "$job$term" ] && ! has pathset && ! command -v "$hit" >/dev/null 2>&1 && d=$(pxglobal "$hit") &&
+				note=" A job or terminal gets Claude Code's PATH, which doesn't have $d: run pixi global's \`$hit\` there by its path (\`$d/$hit\`)."
 		fi
 		if [ -z "$hit$complex" ] && [ "$vb" = 1 ] && e=$(envbin) && [ -n "$e" ]; then
 			hit=${e%% *}
@@ -2642,6 +2906,9 @@ py "*) getcwd; hit=$(pyscript) ;; esac
 	case $job$term in
 	check | gw)
 		what=job shis="checkpoint runs the job with /bin/sh, which here is"
+		# (a checkpoint job is read as the gateway's bash too, see above)
+		[ "$job" = check ] && { [ "$tag" = f52 ] || { [ "$tag" = b52 ] && [ "$sb52" != 1 ]; }; } &&
+			shis="while the gateway serves the session, it runs checkpoint's jobs with its own bash, which is"
 		[ "$job" = gw ] && shis="the gateway runs the job with its own bash, which is"
 		again="start the job again with \`PIXI_GUARD=ask\` in front of its command (with \`argv\`, as its first element)" ;;
 	1)
@@ -2649,22 +2916,20 @@ py "*) getcwd; hit=$(pyscript) ;; esac
 		again="send it again as \`PIXI_GUARD=ask <command>\`" ;;
 	*)
 		what=command shis="Claude Code's shell here is"
+		[ -n "$pfx" ] && shis="Claude Code runs commands through a shell prefix here, and while the gateway's managed shell isn't ready it runs them with $pfx, which here is"
+		[ -n "$gsh" ] && { [ "$tag" = f52 ] || { [ "$tag" = b52 ] && [ "$sb52" != 1 ]; }; } &&
+			shis="Claude Code runs commands through a shell prefix here, and once the gateway's managed shell is ready it runs them with the gateway's own bash, which is"
 		again="re-run it as \`PIXI_GUARD=ask <command>\`" ;;
 	esac
 	[ -n "$hostid" ] && note="$note (If \`host\` is another machine's id, name that host as gateway.toml does: pixi-guard doesn't check jobs on other hosts.)"
-	if has pathset; then
-		if [ "$gwp" = 1 ]; then
-			gws="The gateway runs the job"; [ -n "$term" ] && gws="The gateway's terminal runs it"
-			note="$note $gws with a PATH of its own (the gateway's folders, gateway.toml's [shell] import_path if set, then /usr/bin, /bin, /usr/sbin and /sbin), not the one pixi-guard sees, so pixi-guard can't tell where \`$hit\` would come from there."
-		else
-			note="$note This command runs it with a PATH of its own (it sets PATH, or uses sudo, su, env -i or xcrun), so pixi-guard can't tell where \`$hit\` would come from."
-		fi
-		note="$note One installed with pixi global or in a pixi environment can be run by its path (\`~/.pixi/bin/$hit\`, \`.pixi/envs/default/bin/$hit\`)."
-	fi
+	has pathset &&
+		note="$note This command runs it with a PATH of its own (it sets PATH, or uses sudo, su, env -i or xcrun), so pixi-guard can't tell where \`$hit\` would come from. One installed with pixi global or in a pixi environment can be run by its path (\`~/.pixi/bin/$hit\`, \`.pixi/envs/default/bin/$hit\`)."
 	[ "$tag" = b32 ] &&
-		note="$note Note: $shis bash 3.2 (macOS's /bin/bash). It ends a \`\$(...)\` at the first \`)\` outside the quotes it sees, even one in a quoted heredoc or a case pattern, and there apostrophes pair up as quotes (Don't ... it's). What follows that \`)\` is read as the rest of the command, where backticks and \`\$(...)\` run. For a commit message or PR body, write it to a file and use \`git commit -F FILE\` (\`gh pr create --body-file FILE\`)."
+		note="$note Note: $shis bash 3.2 (the version of macOS's /bin/bash). It ends a \`\$(...)\` at the first \`)\` outside the quotes it sees, even one in a quoted heredoc or a case pattern, and there apostrophes pair up as quotes (Don't ... it's). What follows that \`)\` is read as the rest of the command, where backticks and \`\$(...)\` run. For a commit message or PR body, write it to a file and use \`git commit -F FILE\` (\`gh pr create --body-file FILE\`)."
 	[ "$tag" = b52 ] &&
 		note="$note Note: $shis bash 5.2 or later. Inside \`\$(...)\` it ends a heredoc at a line that starts with the delimiter and has a \`)\` after it (such as \`EOFError ... :)\`), and reads the rest of that line as commands; that \`)\` can end the \`\$(...)\`, and backticks and \`\$(...)\` after it run. For a commit message or PR body, write it to a file and use \`git commit -F FILE\` (\`gh pr create --body-file FILE\`)."
+	[ "$tag" = f52 ] &&
+		note="$note Note: $shis bash 5.2 or later, and bash 5.2 has no \`\${ CMD; }\`: it reads \`\${\` up to the first \`}\` as a bad substitution, drops the rest of that line and runs the lines after it, even ones bash 5.3 reads as a quoted heredoc. Use \`\$(...)\` instead."
 	# A package installer run by pixi (pixi run pip install, see pixi() in
 	# scan) is in pixi, but behind its lock file's back.
 	case $hit in
@@ -2696,10 +2961,10 @@ py "*) getcwd; hit=$(pyscript) ;; esac
 	# (a pixi run ... refusal: pixi is there, or the command fails anyway)
 	if [ -z "$px" ] && ! pixi_where >/dev/null; then
 		sid=$(field session_id | tr -c 'A-Za-z0-9_-' '_' | cut -c 1-128)
-		if [ -n "$sid" ] && [ -e "$told/$sid" ]; then
+		if [ -n "$sid" ] && [ -n "$told" ] && [ -e "$told/$sid" ]; then
 			todo="pixi is still not found (the user has been told). Wait for the user to install it, or, if they said to go ahead without pixi, $again so they can approve it."
 		else
-			if [ -n "$sid" ] && mkdir -p "$told" 2>/dev/null; then
+			if [ -n "$sid" ] && [ -n "$told" ] && mkdir -p "$told" 2>/dev/null; then
 				: > "$told/$sid" 2>/dev/null
 				prune_told
 			fi
@@ -2735,7 +3000,7 @@ py "*) getcwd; hit=$(pyscript) ;; esac
 		todo="$proj_root is a Python project that is not on pixi. Load the skill pixi-guard:project and follow it: ask the user once whether to convert this project to pixi (their own code) or wrap it without changing tracked files (someone else's code). If nothing may be added to the folder at all, put the wrapper at $(wrap_manifest "$proj_root")."
 		;;
 	*)
-		todo="No pixi workspace here. For a one-off use \`pixi exec --spec python --spec <pkg> python ...\`; for a script, \`pixi init --script file.py\` and \`pixi exec\`; for ongoing work, \`pixi init\` (ask the user before creating a workspace)."
+		todo="No pixi workspace here. For a one-off use \`pixi exec --spec python --spec <pkg> python ...\`; for a script, \`pixi init --script file.py\` (it adds a PEP 723 block) and \`pixi run --script file.py\`; for ongoing work, \`pixi init\` (ask the user before creating a workspace)."
 		;;
 	esac
 	# (a job: the pixi command goes in the job, not in Bash)
